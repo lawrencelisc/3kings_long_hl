@@ -60,7 +60,7 @@ import os
 import logging
 import sys
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from collections import deque
 
 
@@ -291,7 +291,7 @@ def write_heartbeat() -> None:
     try:
         payload = {
             'ts':        time.time(),
-            'iso':       datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'iso':       datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
             'positions': len(positions),
             'sim_mode':  SIMULATION_MODE,
         }
@@ -1258,7 +1258,7 @@ def get_btc_regime_v3_fast() -> dict:
             '' if lbl == '' else f"  {lbl:<{pad}}{val}"
             for lbl, val in zip(labels, values)
         ]
-        utc_str  = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        utc_str  = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         hdr_line = (f"🌐 市場狀態 V3-HL（{len(regime_data)} 個資產）[{utc_str}]"
                     + (" [SIM]" if SIMULATION_MODE else " [LIVE]"))
         sep_len  = max(len(hdr_line), max((len(L) for L in table_lines if L), default=0)) + 2
