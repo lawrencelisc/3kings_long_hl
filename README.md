@@ -20,14 +20,14 @@
 
     Ubuntu 20.04 (Debian-based Linux)
     ```shell script
-    cd ./algo_3kings_long_hl
+    cd ./3kings_long_hl
     python3.12 -m venv venv/
     source ./venv/bin/activate
     ```
    
     Windows 10
     ```shell script
-    cd .\algo_3kings_long_hl
+    cd .\3kings_long_hl
     python -m venv .\venv\
     .\venv\Scripts\activate
     ```
