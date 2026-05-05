@@ -1,0 +1,16 @@
+# algo_3kings_long_hl.py
+ccxt
+pandas
+numpy
+python-dotenv
+
+# Hyperliquid / wallet signing (often transitive via ccxt; pinned here for clearer installs)
+eth-account
+web3
+
+# prototype/*.py (config.yaml)
+PyYAML
+
+# Optional — enable when you add these modules under the project root / utils/
+# python-telegram-bot
+# influxdb-client

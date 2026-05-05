@@ -1,0 +1,16 @@
+[Unit]
+Description=3kings_long_hl - Bybit Quant Bot (LIVE / algo_3kings_long_hl.py)
+After=network.target
+
+[Service]
+Type=simple
+Environment=SSL_CERT_FILE=/usr/local/app/algo_3kings_long_hl/venv/lib/python3.12/site-packages/certifi/cacert.pem
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=/usr/local/app/algo_3kings_long_hl
+ExecStart=/usr/local/app/algo_3kings_long_hl/venv/bin/python3.12 -u algo_3kings_long_hl.py
+Restart=always
+RestartSec=10
+User=root
+
+[Install]
+WantedBy=multi-user.target
