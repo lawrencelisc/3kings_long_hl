@@ -52,7 +52,7 @@
 #### Running via Systemd
 1. Move the file to Systemd's system folder.
     ```shell script
-    sudo cp ./algo_3kings_long_hl.service /etc/systemd/system/algo_3kings_long_hl.service
+    sudo cp ./3kings_long_hl.service /etc/systemd/system/3kings_long_hl.service
     ```
 2. Enable and start the service.
     ```shell script
