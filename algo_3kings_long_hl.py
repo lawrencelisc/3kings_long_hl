@@ -1158,6 +1158,7 @@ def get_btc_regime_v3_fast() -> dict:
         NDIPDI_THR    = 3.0
 
         # Long-only: only +2 (Trend Long) is emitted; bear-block and high-vol suppress it
+        # [SOFT-DAILY] daily filter 由「硬封鎖」改為「軟降倉」，main loop 依 daily_bull 縮倉
         if is_highvol:
             regime_signal = 0
             _block_reason.append(f"L1-HighVol: ATR%={mean_atr:.4f} > {atr_hi:.4f}")
@@ -1166,12 +1167,11 @@ def get_btc_regime_v3_fast() -> dict:
                 if is_bear:
                     regime_signal = 0
                     _block_reason.append("L3-Bear擋+2 (macroADX>30, >50% assets falling)")
-                elif not daily_bull:
-                    # [WIN-NLG-A] 多資產日線結構不偏多
-                    regime_signal = 0
-                    _block_reason.append(f"L3-DailyFilter擋+2 (1D共識={dir_1d_consensus:+d})")
                 else:
                     regime_signal = +2
+                    if not daily_bull:
+                        # 仍然發 +2，但標記讓 main loop 縮半倉
+                        print(f"  ⚠️ [SOFT-DAILY] 1D共識={dir_1d_consensus:+d}，將縮半倉入場")
             else:
                 if not (mean_ndipdi < -NDIPDI_THR):
                     _block_reason.append(
@@ -1334,6 +1334,8 @@ def get_btc_regime_v3_fast() -> dict:
             'is_bear':       is_bear,
             'adx_mei':       adx_mei,
             'adx_velocity':  adx_velocity_n,
+            'daily_bull':    daily_bull,        # [SOFT-DAILY] main loop 依此縮倉
+            'daily_consensus': dir_1d_consensus,
         }
         _regime_cache['data'] = result
         _regime_cache['ts']   = time.time()
@@ -2306,6 +2308,13 @@ def main() -> None:
                     # Sensor B: progressive scaling
                     _b_scale = SENSOR_B_SCALE.get(_persist, 1.0 if _persist >= 4 else 0.25)
                     position_multiplier = min(position_multiplier, _b_scale)
+
+                    # [SOFT-DAILY] 1D 多資產日線結構不偏多時：軟降倉（× 0.5）
+                    _daily_bull       = regime.get('daily_bull', True)
+                    _daily_consensus  = regime.get('daily_consensus', 0)
+                    if not _daily_bull:
+                        position_multiplier *= 0.5
+                        print(f"  📉 [SOFT-DAILY] 1D共識={_daily_consensus:+d} → 倉位 × 0.5")
 
                     _icon = ("🟠" if position_multiplier <= 0.3 else
                              "🟡" if position_multiplier <= 0.7 else "🟢")
