@@ -1310,16 +1310,17 @@ def get_btc_regime_v3_fast() -> dict:
             v1  = (a1 - a0) / dt1
             v2  = (a2 - a1) / dt2
             adx_velocity_n = v2
-            adx_mei = (v2 - v1) / abs(v1) if abs(v1) > 0.01 else 0.0
+            # 用 max(abs(v1), 1.0) 作分母，避免 v1≈0 時 MEI 爆炸到 ±100+
+            adx_mei = (v2 - v1) / max(abs(v1), 1.0)
         elif len(_adx_history) >= 2:
             t0, a0 = _adx_history[-2]
             t1, a1 = _adx_history[-1]
             adx_velocity_n = (a1 - a0) / max((t1 - t0) / 300, 0.01)
 
         if len(_adx_history) >= 3:
-            mei_status = ("🔴頂部確認" if adx_mei < -0.8 else
-                          "🟠動能鈍化" if adx_mei < -0.5 else
-                          "🟡輕微減速" if adx_mei < -0.3 else "🟢加速/勻速")
+            mei_status = ("🔴頂部確認" if adx_mei < -2.0 else
+                          "🟠動能鈍化" if adx_mei < -1.5 else
+                          "🟡輕微減速" if adx_mei < -1.0 else "🟢加速/勻速")
             print(f"  📐 ADX MEI={adx_mei:+.2f} | Vel={adx_velocity_n:+.3f}/bar | {mei_status}")
 
         result = {
@@ -2293,14 +2294,15 @@ def main() -> None:
                         else: break
 
                     # MEI: top protection gate
-                    if adx_mei < -0.8:
+                    # 閾值放寬：-2.0（原 -0.8），避免 ADX 正常減速被誤判為頂部
+                    if adx_mei < -2.0:
                         print(f"🔴 [MEI] 頂部確認={adx_mei:.2f}，跳過多頭（ADX={mean_adx:.1f}）")
                         _last_brake_state = _current_state
                         time.sleep(POSITION_CHECK_INTERVAL)
                         continue
-                    elif adx_mei < -0.5:
+                    elif adx_mei < -1.5:
                         position_multiplier = 0.3
-                    elif adx_mei < -0.3:
+                    elif adx_mei < -1.0:
                         position_multiplier = 0.7
                     else:
                         position_multiplier = 1.0
