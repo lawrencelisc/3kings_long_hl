@@ -61,7 +61,6 @@ import logging
 import sys
 import json
 from datetime import datetime, timezone
-from collections import deque
 
 
 def _influx_noop(*_args, **_kwargs):
@@ -219,13 +218,11 @@ if SIMULATION_MODE:
 positions:          dict  = {}
 cooldown_tracker:   dict  = {}
 consecutive_losses: dict  = {}
-recent_sl_times:    list  = []
 
-# ADX MEI tracking (last 3 regime snapshots)
-_adx_history: list = []
-
-# Sensor B: regime confidence history (12-bar memory)
-_regime_signal_history: deque = deque(maxlen=12)
+# [V4-MOMENTUM] Removed:
+#   _adx_history          (fed MEI top-protection gate — gate removed)
+#   _regime_signal_history (fed Sensor B ramp — late-entry magnifier removed)
+#   recent_sl_times       (fed Cascade SL freeze — was a band-aid for top-chasing)
 
 # Telegram: track last notification
 _last_market_signal            = 0
@@ -241,9 +238,18 @@ RISK_PER_TRADE         = 0.005
 MIN_NOTIONAL           = 10.0         # [HL-2] HL minimum ~$10 USDC
 MAX_NOTIONAL_PER_TRADE = 40.0
 
+# [V4-MOMENTUM] R:R reversed: TP=3×ATR / SL=1.2×ATR → 2.5:1 (was 0.875:1)
+# Old (3.5/4.0) requires 53% WR breakeven; new (3.0/1.2) only needs 28.6% WR.
 NET_FLOW_SIGMA = 1.2
-TP_ATR_MULT    = 3.5
-SL_ATR_MULT    = 4.0
+TP_ATR_MULT    = 3.0
+SL_ATR_MULT    = 1.2
+
+# [V4-MOMENTUM] Anti-chase: skip new entries if BTC already pumped > MAX_30MIN_PUMP_PCT
+# in the last 30 minutes (catches trend FORMATION, not late confirmation).
+MAX_30MIN_PUMP_PCT = float(os.getenv('MAX_30MIN_PUMP_PCT', '0.015'))   # 1.5%
+
+# [V4-MOMENTUM] ADX rising threshold (per 5m bar) — formation signal, NOT confirmation
+ADX_RISING_THR = float(os.getenv('ADX_RISING_THR', '0.5'))
 
 MAX_CONSECUTIVE_LOSSES = 3
 DYNAMIC_BAN_DURATION   = 86400
@@ -253,27 +259,22 @@ FEE_RATE       = float(os.getenv('FEE_RATE',       '0.000389'))  # taker (IOC or
 FEE_RATE_MAKER = float(os.getenv('FEE_RATE_MAKER', '0.000130'))  # maker (limit, ref only)
 
 MAX_CONCURRENT_POSITIONS = 5
-CASCADE_SL_WINDOW        = 180   # seconds
-CASCADE_SL_TRIGGER       = 2     # consecutive SLs within window
 
 SCOUTING_INTERVAL = 125
 # [HL-10] Reduced from 4s: HL sub-100ms latency allows tighter monitoring
 POSITION_CHECK_INTERVAL = 2
 
-TIMEOUT_SECONDS      = 5400     # 90 min first timeout
-TIMEOUT_EXTENSION    = 10800    # 180 min extension if health check passes
+# [V4-MOMENTUM] Tightened from 90min → 30min. Momentum trades that don't work in
+# 30min are unlikely to recover; holding longer just bleeds opportunity cost.
+TIMEOUT_SECONDS      = 1800     # 30 min hard timeout
 TIMEOUT_LOSS_FLOOR   = -0.003   # immediate exit if loss > 0.3%
-TIMEOUT_EXT_ADX_MIN  = 25.0
-
-# Sensor B: progressive position sizing by consecutive regime count
-SENSOR_B_SCALE = {1: 0.25, 2: 0.50, 3: 0.80, 4: 1.00}
 
 # [HL-23] Long-only: only regime_signal +2 (Trend Long) is acted upon
 ACTIVE_LONG_SIGNALS = [2]
 
 # Coin scouting filters
 MIN_VOLUME_USDC      = float(os.getenv('MIN_VOLUME_USDC',      '5_000_000'))  # 500萬 USDC/day floor
-MAX_SCOUT_CHANGE_PCT = float(os.getenv('MAX_SCOUT_CHANGE_PCT', '20.0'))       # skip >20% already pumped
+MAX_SCOUT_CHANGE_PCT = float(os.getenv('MAX_SCOUT_CHANGE_PCT', '8.0'))        # tightened: 20→8% daily
 
 
 # ==========================================
@@ -634,10 +635,11 @@ def load_dynamic_blacklist() -> None:
 def handle_trade_result(symbol: str, pnl: float, is_sl_exit: bool = False) -> None:
     """
     Update consecutive-loss counter and apply dynamic 24h ban if threshold reached.
-    is_sl_exit=True  → count toward Cascade SL tracker (real SL/Trail SL).
-    is_sl_exit=False → Timeout/Flow exits do not trigger cascade protection.
+    [V4-MOMENTUM] is_sl_exit kept as kwarg for callsite compatibility but no longer
+    feeds Cascade SL tracking (Cascade SL freeze removed — see strategy params).
     """
-    global consecutive_losses, cooldown_tracker, recent_sl_times
+    global consecutive_losses, cooldown_tracker
+    _ = is_sl_exit  # accepted but unused; kept for API compatibility
     if pnl > 0:
         consecutive_losses[symbol] = 0
         if symbol in cooldown_tracker:
@@ -645,8 +647,6 @@ def handle_trade_result(symbol: str, pnl: float, is_sl_exit: bool = False) -> No
         print(f"🏆 {symbol} 贏錢平倉！解除冷卻，允許乘勝追擊！")
     elif pnl < 0:
         consecutive_losses[symbol] = consecutive_losses.get(symbol, 0) + 1
-        if is_sl_exit:
-            recent_sl_times.append(time.time())
         if consecutive_losses[symbol] >= MAX_CONSECUTIVE_LOSSES:
             cooldown_tracker[symbol] = time.time() + DYNAMIC_BAN_DURATION
             print(f"🚫 [動態封禁] {symbol} 已連續虧損 {consecutive_losses[symbol]} 次！打入冷宮 24 小時。")
@@ -683,104 +683,11 @@ def get_live_positions_cached() -> list:
         return _positions_cache['data'] or []
 
 
-# ==========================================
-# 📐 [MODULE 5b] No-Lag Direction Detector
-# ==========================================
-# 取代所有 EMA 方向判斷。原則：
-#   1. 線性回歸斜率 (OLS slope)：對最近 N 根 close 做最小平方擬合，
-#      斜率反映「當下窗口內價格的平均變化速率」，無歷史拖累。
-#   2. Donchian 結構：看最近 N 根的 HH/HL pattern，純結構判斷，零 lag。
-#   3. 雙確認：方向向上 = 斜率 > 閾值 AND (高點抬升 OR 至少不破前低)
-#
-# 原 EMA21 邏輯被下列函數取代，保留 ADX/DI 系統內部 Wilder smoothing
-# (該 EWM 是 ADX 公式組件，不是滯後方向判斷)。
-
-def _slope_norm(values: np.ndarray, lookback: int = 8) -> float:
-    """
-    線性回歸斜率，正規化為「每根 K 線的相對變化率」(無單位)。
-    返回值 > 0 表示窗口內整體上升；正規化讓不同價格的幣可比較。
-    """
-    if len(values) < lookback:
-        return 0.0
-    y = values[-lookback:].astype(float)
-    x = np.arange(lookback, dtype=float)
-    # OLS: slope = cov(x,y) / var(x)
-    x_mean = x.mean()
-    y_mean = y.mean()
-    denom  = ((x - x_mean) ** 2).sum()
-    if denom <= 0 or y_mean <= 0:
-        return 0.0
-    slope = ((x - x_mean) * (y - y_mean)).sum() / denom
-    return float(slope / y_mean)   # 正規化為相對速率
-
-
-def _donchian_structure(highs: np.ndarray, lows: np.ndarray,
-                        lookback: int = 10) -> dict:
-    """
-    Donchian 結構檢測：
-      - higher_high : 最近 K 線高點 vs 前段高點是否抬升
-      - higher_low  : 最近 K 線低點 vs 前段低點是否抬升
-      - not_lower_low: 沒創新低（防破位）
-    """
-    if len(highs) < lookback * 2 or len(lows) < lookback * 2:
-        return {'higher_high': False, 'higher_low': False, 'not_lower_low': False}
-    recent_hi    = float(np.max(highs[-lookback:]))
-    prev_hi      = float(np.max(highs[-lookback*2:-lookback]))
-    recent_lo    = float(np.min(lows[-lookback:]))
-    prev_lo      = float(np.min(lows[-lookback*2:-lookback]))
-    return {
-        'higher_high':   recent_hi > prev_hi,
-        'higher_low':    recent_lo > prev_lo,
-        'not_lower_low': recent_lo >= prev_lo * 0.998,   # 0.2% tolerance
-    }
-
-
-def _no_lag_direction(closes: np.ndarray, highs: np.ndarray, lows: np.ndarray,
-                      slope_lookback: int = 8, struct_lookback: int = 10,
-                      slope_threshold: float = 0.0005) -> dict:
-    """
-    無滯後方向判斷：線性回歸斜率 + Donchian 結構雙確認。
-    返回:
-      direction: +1=多頭, -1=空頭, 0=無方向
-      slope:     正規化斜率（每根 K 的相對變化率）
-      struct:    Donchian 結構詳情
-    """
-    n = min(len(closes), len(highs), len(lows))
-    if n < max(slope_lookback, struct_lookback * 2):
-        return {'direction': 0, 'slope': 0.0,
-                'struct': {'higher_high': False, 'higher_low': False, 'not_lower_low': False}}
-
-    slope  = _slope_norm(closes, slope_lookback)
-    struct = _donchian_structure(highs, lows, struct_lookback)
-
-    # 多頭：斜率 > 閾值 AND (高點抬升 OR 至少未破前低)
-    is_up = (slope >  slope_threshold) and (struct['higher_high'] or struct['not_lower_low'])
-    # 空頭：斜率 < -閾值 AND 沒抬升
-    is_dn = (slope < -slope_threshold) and (not struct['higher_low'])
-
-    direction = +1 if is_up else (-1 if is_dn else 0)
-    return {'direction': direction, 'slope': slope, 'struct': struct}
-
-
-def _multi_asset_direction_consensus(regime_data: dict, slope_lookback: int = 8,
-                                     struct_lookback: int = 10,
-                                     consensus_ratio: float = 0.375) -> int:
-    """
-    多資產方向共識（取代 _ema_direction）。
-    對每個資產跑 _no_lag_direction，統計多頭/空頭票數。
-    consensus_ratio=0.375 等同原 EMA 邏輯（8 個資產需 3 個共識）。
-    """
-    up_c = dn_c = 0
-    n_assets = len(regime_data)
-    for sym, data in regime_data.items():
-        d = _no_lag_direction(data['closes'], data['highs'], data['lows'],
-                              slope_lookback, struct_lookback)
-        if   d['direction'] == +1: up_c += 1
-        elif d['direction'] == -1: dn_c += 1
-    threshold = max(1, int(n_assets * consensus_ratio))
-    if up_c >= threshold: return +1
-    if dn_c >= threshold: return -1
-    return 0
+# [V4-MOMENTUM] No-Lag Direction Detector REMOVED.
+# Old _slope_norm + _donchian_structure + _no_lag_direction + _multi_asset_direction_consensus
+# fed the 5m / 1H / 1D direction filters that were proven to be top-chasing
+# (correlation with fwd 30m return: -0.12 / 0 / 0). New trend-formation logic uses
+# ADX velocity + breakout detection at the symbol level instead.
 
 
 # ==========================================
@@ -788,12 +695,14 @@ def _multi_asset_direction_consensus(regime_data: dict, slope_lookback: int = 8,
 # ==========================================
 def check_symbol_trend(symbol: str) -> dict:
     """
-    Per-symbol trend confirmation for Tier 2 coins.
-    [HL-22] Removed convert_to_bybit_symbol() and params={'category': 'linear'}.
-    [WIN-NLG] Replaced EMA21 slope with no-lag direction detector
-              (linear regression slope + Donchian structure dual-confirm).
-              Added 1H multi-bar HTF check (also no-lag).
-    Returns dict with is_long_ok, adx, di_spread, slope_5m, struct_5m, trend_score, htf_ok.
+    [V4-MOMENTUM] Per-symbol gate — REWRITTEN to detect trend FORMATION + breakout,
+                  not late confirmation.
+
+    OLD logic: ADX>=22 + DI_spread>=3 + 5m direction=+1 + 1H HTF=+1
+               → all 4 are lagging confirmations; entries hit local tops.
+    NEW logic: ADX rising AND price near/above 20-bar high
+               → catches breakouts as they form, before extension.
+
     Cache: 60 seconds.
     """
     cached = _symbol_trend_cache.get(symbol)
@@ -801,9 +710,8 @@ def check_symbol_trend(symbol: str) -> dict:
         return cached['data']
 
     try:
-        # [HL-22] Direct CCXT symbol — no Bybit conversion or category params
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe='5m', limit=100)
-        if len(ohlcv) < 50:
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe='5m', limit=80)
+        if len(ohlcv) < 30:
             result = {'is_long_ok': False, 'reason': 'insufficient data'}
             _symbol_trend_cache[symbol] = {'data': result, 'ts': time.time()}
             return result
@@ -830,62 +738,38 @@ def check_symbol_trend(symbol: str) -> dict:
             pdi = np.where(atr_s > 0, 100.0 * pdm_s / atr_s, 0.0)
             ndi = np.where(atr_s > 0, 100.0 * ndm_s / atr_s, 0.0)
             dx  = np.where((pdi + ndi) > 0, 100.0 * np.abs(pdi - ndi) / (pdi + ndi), 0.0)
-        adx_arr   = pd.Series(dx).ewm(alpha=1.0 / win, adjust=False).mean().values
-        # [WIN-NLG] 取代 EMA21 斜率：用線性回歸斜率 + Donchian 結構雙確認
-        nlg_5m    = _no_lag_direction(closes, highs, lows,
-                                      slope_lookback=8, struct_lookback=10,
-                                      slope_threshold=0.0005)
-        slope_5m  = nlg_5m['slope']
-        struct_5m = nlg_5m['struct']
-        dir_5m    = nlg_5m['direction']
+        adx_arr = pd.Series(dx).ewm(alpha=1.0 / win, adjust=False).mean().values
 
-        current_adx = float(adx_arr[-1])
-        current_pdi = float(pdi[-1])
-        current_ndi = float(ndi[-1])
-        di_spread   = current_pdi - current_ndi
+        # [V4] Formation signals
+        adx_now      = float(adx_arr[-1])
+        adx_5bar_ago = float(adx_arr[-6]) if len(adx_arr) >= 6 else adx_now
+        adx_rising   = (adx_now - adx_5bar_ago) > ADX_RISING_THR
 
-        # ADX 30-35 = 鈍化過渡死亡區，要求更強 DI spread
-        _long_di_min = 5.0 if 30.0 <= current_adx < 35.0 else 3.0
-        is_long_ok_5m = (current_adx >= 22.0 and di_spread >= _long_di_min and dir_5m == +1)
+        # Breakout detector: current close near or above 20-bar high
+        n_break = min(20, len(closes) - 1)
+        recent_high = float(np.max(highs[-n_break:-1])) if n_break > 1 else closes[-1]
+        breakout    = closes[-1] >= recent_high * 0.999    # within 0.1% of new high
 
-        # [WIN-NLG] 1H Higher Timeframe Filter（無滯後）
-        # 用 1H K 線跑同一個 _no_lag_direction，要求 1H 也是 +1 多頭結構
-        htf_ok     = True
-        htf_reason = 'API_skip'
-        try:
-            ohlcv_1h = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=50)
-            if len(ohlcv_1h) >= 25:
-                df_1h     = pd.DataFrame(ohlcv_1h, columns=['ts', 'o', 'h', 'l', 'c', 'v'])
-                closes_1h = df_1h['c'].values.astype(float)
-                highs_1h  = df_1h['h'].values.astype(float)
-                lows_1h   = df_1h['l'].values.astype(float)
-                nlg_1h    = _no_lag_direction(closes_1h, highs_1h, lows_1h,
-                                              slope_lookback=10, struct_lookback=8,
-                                              slope_threshold=0.0008)
-                htf_ok    = (nlg_1h['direction'] == +1)
-                htf_reason = (f"1H slope={nlg_1h['slope']*100:+.3f}% "
-                              f"HH={nlg_1h['struct']['higher_high']} "
-                              f"HL={nlg_1h['struct']['higher_low']}")
-        except Exception as _htf_e:
-            logger.debug(f"[WIN-NLG] {symbol} 1H數據失敗: {_htf_e}")
+        # Anti-chase: this symbol's 30min pump (6 bars on 5m chart)
+        sym_30m_pump = float(closes[-1] / closes[-7] - 1) if len(closes) > 7 else 0.0
+        not_extended = sym_30m_pump < (MAX_30MIN_PUMP_PCT * 1.5)   # symbol-level looser than BTC
 
-        # 最終判斷：5m 條件 AND 1H 方向確認
-        is_long_ok = is_long_ok_5m and htf_ok
+        di_spread   = float(pdi[-1]) - float(ndi[-1])
+        di_ok       = di_spread >= 0.0   # PDI weakly dominant — relaxed from old +3.0/+5.0
 
-        adx_score   = min(current_adx / 40.0, 1.0)
-        di_score    = min(abs(di_spread) / 20.0, 1.0)
-        trend_score = (adx_score + di_score) / 2.0
+        is_long_ok = adx_rising and breakout and not_extended and di_ok
 
         result = {
-            'is_long_ok':  is_long_ok,
-            'adx':         round(current_adx, 2),
-            'di_spread':   round(di_spread, 2),
-            'slope_5m':    round(slope_5m * 100, 4),     # 顯示為 % 形式
-            'struct_5m':   struct_5m,
-            'dir_5m':      dir_5m,
-            'trend_score': round(trend_score, 3),
-            'htf_ok':      htf_ok,
-            'htf_reason':  htf_reason,
+            'is_long_ok':   is_long_ok,
+            'adx':          round(adx_now, 2),
+            'adx_velocity': round(adx_now - adx_5bar_ago, 2),
+            'di_spread':    round(di_spread, 2),
+            'breakout':     breakout,
+            'sym_30m_pump': round(sym_30m_pump * 100, 2),
+            'reason':       (
+                f"ΔADX={adx_now-adx_5bar_ago:+.1f} brk={int(breakout)} "
+                f"30m={sym_30m_pump*100:+.2f}% DI={di_spread:+.1f}"
+            ),
         }
         _symbol_trend_cache[symbol] = {'data': result, 'ts': time.time()}
         return result
@@ -1004,9 +888,8 @@ def get_btc_regime_v3_fast() -> dict:
         regime_data = {}
         all_bbw     = []
         all_atr_pct = []
-
-        # [WIN-NLG-A] 同步收集 1D 多資產數據（用於日線結構共識，取代單一 BTC EMA20）
-        regime_data_1d = {}
+        # [V4-MOMENTUM] 1D daily filter REMOVED — confirmed top-chasing on 5m timeframe
+        # (correlation of multi-day directional confirmation with fwd 30m return: ≈ 0)
 
         for sym in REGIME_ASSETS:
             try:
@@ -1039,21 +922,6 @@ def get_btc_regime_v3_fast() -> dict:
                 logger.warning(f"⚠️ {sym} 指標計算失敗: {e}")
                 continue
 
-        # [WIN-NLG-A] 取 1D 數據做多資產日線方向共識（取代單一 BTC EMA20 Filter）
-        for sym in REGIME_ASSETS:
-            try:
-                ohlcv_1d = exchange.fetch_ohlcv(sym, timeframe='1d', limit=30)
-                if len(ohlcv_1d) >= 22:
-                    df_1d = pd.DataFrame(ohlcv_1d, columns=['ts', 'o', 'h', 'l', 'c', 'v'])
-                    regime_data_1d[sym] = {
-                        'closes': df_1d['c'].values.astype(float),
-                        'highs':  df_1d['h'].values.astype(float),
-                        'lows':   df_1d['l'].values.astype(float),
-                    }
-            except Exception as _e1d:
-                logger.debug(f"⚠️ {sym} 1D 數據獲取失敗: {_e1d}")
-                continue
-
         if not regime_data:
             result = {'signal': 0, 'brake': False, 'soft_brake': False,
                       'brake_reason': 'No data', 'regime_signal': 0}
@@ -1068,9 +936,13 @@ def get_btc_regime_v3_fast() -> dict:
         bb_thr = safe_pct(all_bbw,     TR_BB_PCT)
         atr_hi = safe_pct(all_atr_pct, HVOL_ATR_PCT)
 
-        last_adx      = []; last_bbw = []; last_atr    = []
-        last_ndipdi   = []; last_ndi = []; last_pdi    = []
-        last_ndi_prev = []; last_pdi_prev = []
+        # [V4-MOMENTUM] Collect last + 5-bar-ago snapshots for 'ADX rising' detection.
+        # Old code collected only DI for "PDI rising" check — that filter had ≈0 correlation
+        # with forward returns; we replace it with multi-bar ADX velocity instead.
+        last_adx     = []; last_bbw     = []; last_atr      = []
+        last_ndipdi  = []; last_ndi     = []; last_pdi      = []
+        adx_5bar_ago = []; bbw_5bar_ago = []
+        btc_30m_pump = 0.0   # populated below from BTC closes
 
         for sym, data in regime_data.items():
             idx = len(data['closes']) - 1
@@ -1081,9 +953,10 @@ def get_btc_regime_v3_fast() -> dict:
                 last_ndipdi.append(data['ndi'][idx] - data['pdi'][idx])
                 last_ndi.append(data['ndi'][idx])
                 last_pdi.append(data['pdi'][idx])
-                prev_idx = max(0, idx - 1)
-                last_ndi_prev.append(data['ndi'][prev_idx])
-                last_pdi_prev.append(data['pdi'][prev_idx])
+                # 5-bar = 25min on 5m chart — captures trend formation, not just last bar
+                prev_idx5 = max(0, idx - 5)
+                adx_5bar_ago.append(data['adx'][prev_idx5])
+                bbw_5bar_ago.append(data['bbw'][prev_idx5])
 
         if not last_adx:
             result = {'signal': 0, 'brake': False, 'soft_brake': False,
@@ -1098,93 +971,72 @@ def get_btc_regime_v3_fast() -> dict:
         mean_ndipdi   = float(np.mean(last_ndipdi))
         mean_ndi      = float(np.mean(last_ndi))
         mean_pdi      = float(np.mean(last_pdi))
-        mean_ndi_prev = float(np.mean(last_ndi_prev))
-        mean_pdi_prev = float(np.mean(last_pdi_prev))
 
-        DI_SLOPE_EPS = -0.5
-        ndi_slope    = mean_ndi - mean_ndi_prev
-        pdi_slope    = mean_pdi - mean_pdi_prev
-        ndi_rising   = ndi_slope >= DI_SLOPE_EPS
-        pdi_rising   = pdi_slope >= DI_SLOPE_EPS
+        # [V4-MOMENTUM] Trend FORMATION signals (lead) — replace old confirmation gates
+        adx_5bar_avg  = float(np.mean(adx_5bar_ago))
+        bbw_5bar_avg  = float(np.mean(bbw_5bar_ago))
+        adx_velocity  = mean_adx - adx_5bar_avg              # +ve = trend forming
+        bbw_expanding = (mean_bbw > bbw_5bar_avg * 1.05)     # vol breakout: +5%
 
+        # Anti-chase: BTC 30min pump (each bar 5min × 6 bars = 30min)
+        btc_arr = regime_data.get('BTC/USDC:USDC', {}).get('closes', None)
+        if btc_arr is not None and len(btc_arr) > 6:
+            btc_30m_pump = float(btc_arr[-1] / btc_arr[-7] - 1)
+        is_overextended = btc_30m_pump > MAX_30MIN_PUMP_PCT
+
+        # Light direction confirmation: PDI > NDI (don't enter while NDI dominates)
+        # Threshold relaxed from -3 to -1 (was over-restrictive, blocked 80% of valid setups)
+        pdi_dominant = (mean_ndipdi < -1.0)
+
+        # Composite score kept for monitoring/logging only — NOT used as an entry gate
         def _norm(val, lo, hi):
             return float(np.clip((val - lo) / (hi - lo + 1e-9), 0.0, 1.0))
-
         all_adx_np = np.array(last_adx)
         adx_lo = safe_pct(all_adx_np, 10); adx_hi = safe_pct(all_adx_np, 90)
         bbw_lo = safe_pct(all_bbw,     10); bbw_hi = safe_pct(all_bbw,     90)
-
-        adx_n = _norm(mean_adx,       adx_lo, adx_hi)
-        bbw_n = _norm(mean_bbw,       bbw_lo, bbw_hi)
-        di_n  = _norm(-mean_ndipdi,   0.0,    20.0)    # PDI dominance: higher = more bullish
-        # Trend-health score: 0→1, higher = stronger directional bull trend
-        score = 0.5 * adx_n + 0.3 * di_n + 0.2 * bbw_n
+        adx_n  = _norm(mean_adx,     adx_lo, adx_hi)
+        bbw_n  = _norm(mean_bbw,     bbw_lo, bbw_hi)
+        di_n   = _norm(-mean_ndipdi, 0.0,    20.0)
+        score  = 0.5 * adx_n + 0.3 * di_n + 0.2 * bbw_n
 
         is_highvol = (mean_atr > atr_hi)
 
-        bear_votes  = sum(1 for sym, data in regime_data.items()
-                          if len(data['ret']) > 0 and data['ret'][-1] < MACRO_BEAR_RTN_THR)
-        bull_votes  = sum(1 for sym, data in regime_data.items()
-                          if len(data['ret']) > 0 and data['ret'][-1] > MACRO_BULL_RTN_THR)
-        n_assets    = len(regime_data)
-        is_bear_raw = (bear_votes > n_assets // 2)
-        is_bear     = is_bear_raw and mean_adx > 30
+        # Hard bear veto kept (cheap & safe). Threshold: >50% of 8 majors with 7d return < -3%.
+        n_assets   = len(regime_data)
+        bear_votes = sum(1 for sym, data in regime_data.items()
+                         if len(data['ret']) > 0 and data['ret'][-1] < MACRO_BEAR_RTN_THR)
+        bull_votes = sum(1 for sym, data in regime_data.items()
+                         if len(data['ret']) > 0 and data['ret'][-1] > MACRO_BULL_RTN_THR)
+        is_bear    = (bear_votes > n_assets // 2) and mean_adx > 30
         if bull_votes > n_assets // 2:
             is_bear = False
 
-        # [WIN-NLG] 取代 EMA 方向共識：用線性回歸斜率 + Donchian 結構雙確認
-        # 5m 短期方向共識（取代原 _ema_direction）
-        dir_5m_consensus = _multi_asset_direction_consensus(
-            regime_data, slope_lookback=8, struct_lookback=10, consensus_ratio=0.375
-        )
-
-        # [WIN-NLG-A] 1D 多資產日線方向共識（取代單一 BTC EMA20 Filter）
-        # 多數資產日線結構偏多才允許 +2 信號發出
-        if len(regime_data_1d) >= 4:   # 至少 4 個資產有日線數據才判斷
-            dir_1d_consensus = _multi_asset_direction_consensus(
-                regime_data_1d, slope_lookback=10, struct_lookback=7, consensus_ratio=0.50
-            )
-            daily_bull = (dir_1d_consensus == +1)
-        else:
-            dir_1d_consensus = 0
-            daily_bull = True   # 數據不足，預設不擋
-            logger.warning(f"⚠️ [WIN-NLG-A] 1D 數據資產數 {len(regime_data_1d)} < 4，跳過日線Filter")
-
-        print(f"  📅 [WIN-NLG-A] 多資產1D共識: {dir_1d_consensus:+d} "
-              f"({len(regime_data_1d)}個資產) → +2信號{'✅允許' if daily_bull else '🚫封鎖'}")
-
+        # [V4-MOMENTUM] NEW DECISION LOGIC — trend formation, not confirmation
+        # Emit +2 only if:
+        #   1. Not high-vol panic (otherwise wide stops bleed)
+        #   2. Not overextended (BTC hasn't already pumped >1.5% in last 30min)
+        #   3. Trend FORMING — ADX rising OR volatility expanding
+        #   4. PDI not strongly dominated by NDI (light direction filter)
+        #   5. Not in confirmed bear (>50% majors down -3% over 7d AND macro ADX>30)
         regime_signal = 0
         _block_reason = []
-        NDIPDI_THR    = 3.0
 
-        # Long-only: only +2 (Trend Long) is emitted; bear-block and high-vol suppress it
-        # [SOFT-DAILY] daily filter 由「硬封鎖」改為「軟降倉」，main loop 依 daily_bull 縮倉
         if is_highvol:
-            regime_signal = 0
             _block_reason.append(f"L1-HighVol: ATR%={mean_atr:.4f} > {atr_hi:.4f}")
-        elif mean_adx >= 18 and mean_bbw >= bb_thr:
-            if mean_ndipdi < -NDIPDI_THR and dir_5m_consensus == +1 and pdi_rising:
-                if is_bear:
-                    regime_signal = 0
-                    _block_reason.append("L3-Bear擋+2 (macroADX>30, >50% assets falling)")
-                else:
-                    regime_signal = +2
-                    if not daily_bull:
-                        # 仍然發 +2，但標記讓 main loop 縮半倉
-                        print(f"  ⚠️ [SOFT-DAILY] 1D共識={dir_1d_consensus:+d}，將縮半倉入場")
-            else:
-                if not (mean_ndipdi < -NDIPDI_THR):
-                    _block_reason.append(
-                        f"L3C-PDI優勢不足 (需 NDI-PDI<-{NDIPDI_THR}): {mean_ndipdi:+.2f}")
-                if dir_5m_consensus != +1:
-                    _block_reason.append(f"L3D-5m方向無多頭共識: dir={dir_5m_consensus:+d}")
-                if not pdi_rising:
-                    _block_reason.append(f"L3E-PDI未上升: slope={pdi_slope:+.3f}")
+        elif is_overextended:
+            _block_reason.append(f"L2-Overextended: BTC 30m={btc_30m_pump*100:+.2f}%"
+                                 f" > {MAX_30MIN_PUMP_PCT*100:.1f}% (anti-chase)")
+        elif is_bear:
+            _block_reason.append(f"L3-Bear: bear_votes={bear_votes}/{n_assets} & ADX>{30}")
+        elif not (adx_velocity > ADX_RISING_THR or bbw_expanding):
+            _block_reason.append(
+                f"L4-NoFormation: ΔADX(25m)={adx_velocity:+.2f} (need >+{ADX_RISING_THR}) | "
+                f"BBW{'↑' if bbw_expanding else '→'}")
+        elif not pdi_dominant:
+            _block_reason.append(
+                f"L5-NDIDominant: NDI-PDI={mean_ndipdi:+.2f} (need < -1.0)")
         else:
-            if mean_adx < 18:
-                _block_reason.append(f"L3A-ADX不足: {mean_adx:.1f} < 18")
-            if mean_bbw < bb_thr:
-                _block_reason.append(f"L3B-BBW不足: {mean_bbw:.4f} < {bb_thr:.4f}")
+            regime_signal = +2
 
         if regime_signal == 0 and _block_reason:
             print(f"  🚧 信號封鎖原因: {' | '.join(_block_reason)}")
@@ -1213,42 +1065,35 @@ def get_btc_regime_v3_fast() -> dict:
             'decision_text': status_text,
             'mean_ndi':    round(mean_ndi, 3),
             'mean_pdi':    round(mean_pdi, 3),
-            'ndi_slope':   round(ndi_slope, 3),
-            'pdi_slope':   round(pdi_slope, 3),
-            'ndi_rising':  int(ndi_rising),
-            'pdi_rising':  int(pdi_rising),
+            'ndi_slope':   round(adx_velocity, 3),       # [V4] CSV: was ndi_slope, now ΔADX(25m)
+            'pdi_slope':   round(btc_30m_pump * 100, 3), # [V4] CSV: was pdi_slope, now BTC 30m %
+            'ndi_rising':  int(adx_velocity > ADX_RISING_THR),
+            'pdi_rising':  int(bbw_expanding),
             'ndipdi':      round(mean_ndipdi, 3),
             'score':       round(score, 4),
-            'ema_dir':     dir_5m_consensus,   # [WIN-NLG] CSV欄位保留兼容，存入新方向值
+            'ema_dir':     int(pdi_dominant),  # [V4] reused: 1 if PDI dominant
             'is_bear':     int(is_bear),
         })
-
-        _ndi_block = (' [BLOCKED: exhausted]'
-                      if (not ndi_rising and mean_ndipdi > NDIPDI_THR and dir_5m_consensus == -1) else '')
-        _pdi_block = (' [BLOCKED: exhausted]'
-                      if (not pdi_rising and mean_ndipdi < -NDIPDI_THR and dir_5m_consensus == 1) else '')
 
         labels = [
             'BTC/ETH/SOL Price', '',
             'ATR%', 'HighVol', '',
-            'Trend-Health Score', 'ADX', 'BBW', '',
-            '5m Direction', '1D Daily Filter', '',
-            '-DI (mean)', '-DI slope(5m)', '+DI (mean)', '+DI slope(5m)', 'NDI-PDI', '',
+            'Trend-Health Score (info)', 'ADX (mean)', 'BBW (mean)', '',
+            'ΔADX 25m (formation)', 'BBW expanding', 'BTC 30m pump (anti-chase)', '',
+            '-DI (mean)', '+DI (mean)', 'NDI-PDI', '',
             'Bear', 'bear_votes', 'bull_votes', '',
             'Signal', 'Decision',
         ]
         values = [
             f"{btc_p:.0f} / {eth_p:.0f} / {sol_p:.1f}", '',
             f"{mean_atr:.4f} (highvol_thr: {atr_hi:.4f})", f"{'Y ⚠️' if is_highvol else 'N'}", '',
-            f"{score:.3f}  (ADX×0.5 + DI×0.3 + BBW×0.2)",
-            f"{mean_adx:.1f} (>=18 needed)", f"{mean_bbw:.4f} (>={bb_thr:.4f} needed)", '',
-            f"{'↑' if dir_5m_consensus == 1 else '↓' if dir_5m_consensus == -1 else '→'} "
-            f"(slope+structure consensus, need ↑ for +2)",
-            f"{'✅ Bull' if daily_bull else '🚫 Block'}  "
-            f"(1D consensus={dir_1d_consensus:+d}, {len(regime_data_1d)} assets)", '',
-            f"{mean_ndi:.2f}", f"{ndi_slope:+.3f}  {'↑ rising' if ndi_rising else '↓ falling'}{_ndi_block}",
-            f"{mean_pdi:.2f}", f"{pdi_slope:+.3f}  {'↑ rising' if pdi_rising else '↓ falling'}{_pdi_block}",
-            f"{mean_ndipdi:+.2f}  (need <-{NDIPDI_THR} for +2)", '',
+            f"{score:.3f}  (ADX×0.5 + DI×0.3 + BBW×0.2) [INFO ONLY]",
+            f"{mean_adx:.1f}", f"{mean_bbw:.4f}", '',
+            f"{adx_velocity:+.2f}  (need > +{ADX_RISING_THR} for +2)",
+            f"{'✅ ↑' if bbw_expanding else '→'}  (alt-trigger to ΔADX)",
+            f"{btc_30m_pump*100:+.2f}%  (max {MAX_30MIN_PUMP_PCT*100:.1f}% else block)", '',
+            f"{mean_ndi:.2f}", f"{mean_pdi:.2f}",
+            f"{mean_ndipdi:+.2f}  (need <-1.0 for +2)", '',
             f"{'ON 🐻' if is_bear else 'OFF'}", f"{bear_votes}/{n_assets}", f"{bull_votes}/{n_assets}", '',
             f"{signal_names.get(regime_signal, '無信號')}", status_text,
         ]
@@ -1294,34 +1139,10 @@ def get_btc_regime_v3_fast() -> dict:
             except Exception as e:
                 logger.warning(f"⚠️ Telegram市場狀態通知失敗: {e}")
 
-        # ADX MEI (Momentum Exhaustion Index)
-        global _adx_history
-        _adx_history.append((time.time(), mean_adx))
-        _adx_history = _adx_history[-3:]
-
-        adx_mei        = 0.0
-        adx_velocity_n = 0.0
-        if len(_adx_history) >= 3:
-            t0, a0 = _adx_history[-3]
-            t1, a1 = _adx_history[-2]
-            t2, a2 = _adx_history[-1]
-            dt1 = max((t1 - t0) / 300, 0.01)
-            dt2 = max((t2 - t1) / 300, 0.01)
-            v1  = (a1 - a0) / dt1
-            v2  = (a2 - a1) / dt2
-            adx_velocity_n = v2
-            # 用 max(abs(v1), 1.0) 作分母，避免 v1≈0 時 MEI 爆炸到 ±100+
-            adx_mei = (v2 - v1) / max(abs(v1), 1.0)
-        elif len(_adx_history) >= 2:
-            t0, a0 = _adx_history[-2]
-            t1, a1 = _adx_history[-1]
-            adx_velocity_n = (a1 - a0) / max((t1 - t0) / 300, 0.01)
-
-        if len(_adx_history) >= 3:
-            mei_status = ("🔴頂部確認" if adx_mei < -2.0 else
-                          "🟠動能鈍化" if adx_mei < -1.5 else
-                          "🟡輕微減速" if adx_mei < -1.0 else "🟢加速/勻速")
-            print(f"  📐 ADX MEI={adx_mei:+.2f} | Vel={adx_velocity_n:+.3f}/bar | {mei_status}")
+        # [V4-MOMENTUM] ADX MEI (Momentum Exhaustion Index) REMOVED.
+        # MEI was a band-aid for top-chasing entries: flagged "decelerating" ADX as a top.
+        # With trend-FORMATION entries (ADX rising + anti-chase + tight SL), there's no
+        # top to protect — if momentum dies, the 1.2×ATR SL handles it cheaply.
 
         result = {
             'signal':        signal,
@@ -1329,14 +1150,13 @@ def get_btc_regime_v3_fast() -> dict:
             'soft_brake':    soft_brake,
             'brake_reason':  brake_reason,
             'regime_signal': regime_signal,
-            'market_score':  score,        # trend-health 0-1 (ADX×0.5+DI×0.3+BBW×0.2)
+            'market_score':  score,        # trend-health 0-1 (info only, not a gate)
             'mean_adx':      mean_adx,
+            'adx_velocity':  adx_velocity,  # ΔADX over 25m — primary formation signal
+            'bbw_expanding': bbw_expanding,
+            'btc_30m_pump':  btc_30m_pump,  # used by execute_live_long anti-chase guard
             'is_highvol':    is_highvol,
             'is_bear':       is_bear,
-            'adx_mei':       adx_mei,
-            'adx_velocity':  adx_velocity_n,
-            'daily_bull':    daily_bull,        # [SOFT-DAILY] main loop 依此縮倉
-            'daily_consensus': dir_1d_consensus,
         }
         _regime_cache['data'] = result
         _regime_cache['ts']   = time.time()
@@ -1415,56 +1235,7 @@ def scouting_strong_coins(scouting_coins: int = 30) -> list:
 # ==========================================
 # 🔍 [MODULE 9] Lee-Ready Flow Radar (Long)
 # ==========================================
-def check_flow_health(symbol: str) -> str:
-    """
-    Detect extreme sell dumps and momentum deceleration.
-    [HL-11] Deceleration threshold: accel_z < -2.5 (vs Bybit -2.0).
-             HL has ~5-10x higher trade frequency, raising noise floor.
-    """
-    try:
-        trades = exchange.fetch_trades(symbol, limit=100)
-        if not trades or len(trades) < 50:
-            return None
-
-        df                 = pd.DataFrame(trades)
-        df['price_change'] = df['price'].diff()
-        df['direction']    = np.where(df['price_change'] > 0, 1,
-                                      np.where(df['price_change'] < 0, -1, 0))
-        df['direction']    = df['direction'].replace(0, np.nan).ffill().fillna(0)
-        avg_vol            = df['amount'].mean()
-        df['weight']       = np.where(df['amount'] > avg_vol * 2, 2.0, 1.0)
-        df['net_flow']     = df['direction'] * df['amount'] * df['price'] * df['weight']
-
-        flow_std = df['net_flow'].std()
-        if flow_std == 0:
-            return None
-
-        flow_mean      = df['net_flow'].mean()
-        recent_25_flow = df['net_flow'].tail(25).sum()
-        z_score        = (recent_25_flow - flow_mean * 25) / (flow_std * np.sqrt(25))
-
-        if z_score < -3.0:
-            return "Flow Reversal (Long Dump Detected)"
-
-        flow_older_25 = df['net_flow'].iloc[-50:-25].sum()
-        acceleration  = recent_25_flow - flow_older_25
-        accel_z       = acceleration / (flow_std * np.sqrt(25))
-
-        # [HL-11] Threshold raised from -2.0 → -2.5 for HL high-frequency data
-        if accel_z < -2.5 and recent_25_flow < 0:
-            try:
-                ob        = exchange.fetch_order_book(symbol, limit=20)
-                bids_vol  = sum(b[1] for b in ob['bids'])
-                asks_vol  = sum(a[1] for a in ob['asks'])
-                imbalance = ((bids_vol - asks_vol) / (bids_vol + asks_vol)
-                             if (bids_vol + asks_vol) > 0 else 0)
-                if imbalance < -0.15:
-                    return "Flow Deceleration (Momentum Died)"
-            except Exception:
-                pass
-        return None
-    except Exception:
-        return None
+# [V4-MOMENTUM] check_flow_health() REMOVED — see manage_long_positions() for rationale.
 
 
 def apply_lee_ready_long_logic(symbol: str) -> tuple:
@@ -1639,7 +1410,6 @@ def sync_positions_on_startup() -> None:
                 'max_pnl_pct':           0.0,
                 'entry_time':            time.time(),
                 'side':                  'long',
-                'deceleration_detected': False,
             }
             recovered_count += 1
             print(f"✅ 成功尋回孤兒多單: {symbol} | 入場價: {entry_price:.4f} | 已保本: {is_be}")
@@ -1717,7 +1487,6 @@ def manage_long_positions(regime: dict = None) -> None:
                 'max_pnl_pct':           0.0,
                 'entry_time':            real_entry_t,
                 'side':                  'long',
-                'deceleration_detected': False,
             }
             print(f"🚨 [自癒] 發現並接管孤兒多單: {s} | 入場:{entry_p:.4f}")
 
@@ -1789,21 +1558,11 @@ def manage_long_positions(regime: dict = None) -> None:
                     pos['is_breakeven'] = True
                     sl_updated          = True
 
-                # ── Multi-stage variable trailing stop ──
+                # [V4-MOMENTUM] Single-stage trailing stop (was 5-stage with regime/decel branches).
+                # 5-stage trail had no data-driven justification; the only thing that matters
+                # for momentum trades is "give back at most 1×ATR of unrealised peak".
                 if pos['is_breakeven']:
-                    if regime and regime.get('brake'):
-                        trail_sl = curr_p - (0.3 * pos['atr'])
-                    elif regime and regime.get('soft_brake'):
-                        trail_sl = curr_p - (0.6 * pos['atr'])
-                    elif pos.get('deceleration_detected') and pnl_pct > (coin_vol_pct * 2.5):
-                        trail_sl = curr_p - (0.5 * pos['atr'])
-                    elif pnl_pct > (coin_vol_pct * 5.0):
-                        trail_sl = curr_p - (0.8 * pos['atr'])
-                    elif pnl_pct > (coin_vol_pct * 3.5):
-                        trail_sl = curr_p - (1.2 * pos['atr'])
-                    else:
-                        trail_sl = curr_p - (1.8 * pos['atr'])
-
+                    trail_sl = curr_p - (1.0 * pos['atr'])
                     if trail_sl > pos['sl_price']:
                         if (trail_sl - pos['sl_price']) / pos['sl_price'] > 0.0005:
                             sl_updated      = True
@@ -1816,56 +1575,27 @@ def manage_long_positions(regime: dict = None) -> None:
                     if SIMULATION_MODE and s in sim_positions:
                         sim_positions[s]['sl_price'] = pos['sl_price']
 
-                # ── Conditional Timeout Health Check ──
+                # [V4-MOMENTUM] Hard timeout — 30min, no extension.
+                # Old code: 90min first timeout + 180min extension if Regime+ADX still healthy.
+                # Problem: extending bad trades is opportunity-cost expensive AND the
+                # extension condition (Regime>0 + ADX>=25) is itself a top-chasing filter.
+                # Better: cut losses fast, redeploy capital quickly.
                 exit_reason = None
                 time_held   = time.time() - pos.get('entry_time', time.time())
 
                 if time_held > TIMEOUT_SECONDS and pnl_pct < 0.005:
-                    _ext_until = pos.get('timeout_extended_until', 0)
-
                     if pnl_pct < TIMEOUT_LOSS_FLOOR:
-                        exit_reason = "Momentum Timeout (Stalled Zombie)"
-                        print(f"⏱️ {s} Timeout: 虧損 {pnl_pct*100:.2f}% 超過門檻，出場")
+                        exit_reason = "Timeout (Loss Floor)"
+                        print(f"⏱️ {s} 30min Timeout: PnL {pnl_pct*100:+.2f}%，出場")
+                    else:
+                        exit_reason = "Timeout (Stalled)"
+                        print(f"⏱️ {s} 30min Timeout: 未達 +0.5%，釋放資金")
 
-                    elif _ext_until > 0 and time.time() > _ext_until:
-                        exit_reason = "Momentum Timeout (Extended, Still Stalled)"
-                        print(f"⏱️ {s} 延長期亦到期，強制出場（持倉 {time_held/3600:.1f}h）")
-
-                    elif _ext_until == 0:
-                        _reg         = regime or {}
-                        _curr_regime = _reg.get('regime_signal', 0)
-                        _curr_adx    = _reg.get('mean_adx', 0)
-                        _dir_ok      = _curr_regime in (1, 2)
-                        _adx_ok      = _curr_adx >= TIMEOUT_EXT_ADX_MIN
-
-                        if _dir_ok and _adx_ok:
-                            pos['timeout_extended_until'] = time.time() + TIMEOUT_EXTENSION
-                            print(f"🔍 {s} Timeout健康檢查✅: Regime={_curr_regime} ADX={_curr_adx:.1f}"
-                                  f" → 延長 {TIMEOUT_EXTENSION//60} 分鐘")
-                        else:
-                            exit_reason = "Momentum Timeout (Stalled Zombie)"
-                            _fail = []
-                            if not _dir_ok: _fail.append(f"Regime={_curr_regime}方向已轉")
-                            if not _adx_ok: _fail.append(f"ADX={_curr_adx:.1f}<{TIMEOUT_EXT_ADX_MIN}")
-                            print(f"⏱️ {s} Timeout健康檢查❌：{', '.join(_fail)}，出場")
-
-                # ── Flow Health Radar (every 15s, after 1200s hold) ──
-                curr_t     = time.time()
-                last_check = pos.get('last_flow_check', 0)
-                if not exit_reason and (curr_t - last_check > 15):
-                    pos['last_flow_check'] = curr_t
-                    if time_held > 1200:
-                        flow_status = check_flow_health(s)
-                        if flow_status == "Flow Reversal (Long Dump Detected)":
-                            price_drawdown = (curr_p - pos['entry_price']) / pos['entry_price']
-                            if price_drawdown < -0.005:
-                                exit_reason = flow_status
-                            else:
-                                print(f"⚠️ {s} Flow Reversal 信號但價格未確認，忽略")
-                        elif flow_status == "Flow Deceleration (Momentum Died)":
-                            if not pos.get('deceleration_detected'):
-                                pos['deceleration_detected'] = True
-                                print(f"⚠️ {s} 高位收油偵測！啟動防禦標記！")
+                # [V4-MOMENTUM] check_flow_health REMOVED.
+                # Old: "Flow Deceleration" set deceleration_detected=True which then triggered
+                # tighter trail SL → exit too early. "Flow Reversal" tried to predict dumps
+                # but on 60min horizon WR is 44.9% (vs 30min 15.5%) — most "reversals" recover.
+                # Trust the trail SL (1×ATR behind peak) to handle real reversals cheaply.
 
                 # ── Local TP/SL Check ──
                 if not exit_reason:
@@ -1971,16 +1701,21 @@ def execute_live_long(symbol: str, net_flow: float, current_price: float,
     if not (is_strong and is_volatile and symbol not in positions):
         return
 
-    # ── Tier 2 per-symbol trend confirmation ──
+    # [V4-MOMENTUM] Regime-level anti-chase: if BTC has already pumped > MAX_30MIN_PUMP_PCT,
+    # we are too late. The regime detector already enforces this, but we re-check here
+    # because by the time Lee-Ready triggers per-symbol, BTC may have moved further.
+    _btc_pump = (regime or {}).get('btc_30m_pump', 0.0)
+    if _btc_pump > MAX_30MIN_PUMP_PCT:
+        logger.debug(f"⛔ [Anti-chase] {symbol} BTC 30m={_btc_pump*100:+.2f}% > "
+                     f"{MAX_30MIN_PUMP_PCT*100:.1f}%，跳過")
+        return
+
+    # ── [V4] Symbol-level formation gate (ADX rising + breakout + symbol not extended) ──
     _trend = check_symbol_trend(symbol)
     if not _trend.get('is_long_ok'):
-        logger.debug(f"⛔ [Tier2] {symbol} 多頭未確認: ADX={_trend.get('adx')} "
-                     f"DI={_trend.get('di_spread')} slope5m={_trend.get('slope_5m')}% "
-                     f"HTF={_trend.get('htf_reason', 'n/a')}")
+        logger.debug(f"⛔ [Symbol-gate] {symbol} formation 未達: {_trend.get('reason', 'n/a')}")
         return
-    print(f"✅ [Tier2] {symbol} 多頭確認: ADX={_trend['adx']:.1f} "
-          f"DI+={_trend['di_spread']:+.1f} slope5m={_trend.get('slope_5m', 0):+.3f}% "
-          f"HTF={_trend.get('htf_reason', 'n/a')}")
+    print(f"✅ [Symbol-gate] {symbol} formation: {_trend.get('reason', 'n/a')}")
 
     # Tier 2 auto-scale
     if symbol in TIER2_SET:
@@ -2027,13 +1762,7 @@ def execute_live_long(symbol: str, net_flow: float, current_price: float,
         logger.debug(f"⛔ {symbol} 倉位已達上限 {MAX_CONCURRENT_POSITIONS}")
         return
 
-    # Cascade SL protection
-    now = time.time()
-    recent_sl_times[:] = [t for t in recent_sl_times if now - t < CASCADE_SL_WINDOW]
-    if len(recent_sl_times) >= CASCADE_SL_TRIGGER:
-        logger.debug(f"⛔ {symbol} Cascade SL 保護中，拒絕入場")
-        return
-
+    # [V4-MOMENTUM] Cascade SL protection REMOVED — see strategy parameters block.
     cancel_all_hl(symbol)
     actual_bal = get_live_usdc_balance()
     eff_bal    = min(WORKING_CAPITAL, actual_bal)
@@ -2155,7 +1884,6 @@ def execute_live_long(symbol: str, net_flow: float, current_price: float,
         'entry_time':            time.time(),
         'side':                  'long',
         'entry_regime_signal':   regime_signal_tag,
-        'deceleration_detected': False,
     }
     cooldown_tracker[symbol] = time.time() + 480
     save_dynamic_blacklist()
@@ -2204,8 +1932,11 @@ def execute_live_long(symbol: str, net_flow: float, current_price: float,
 def main() -> None:
     mode_label = "🔵 SIMULATION" if SIMULATION_MODE else "🟢 LIVE TRADE"
     print("=" * 60)
-    print(f"🚀 AI 實戰 V3 Trend Long [Hyperliquid] [{mode_label}] 啟動")
-    print(f"   SL={SL_ATR_MULT}×ATR | TP={TP_ATR_MULT}×ATR | USDC | ActiveSignals={ACTIVE_LONG_SIGNALS}")
+    print(f"🚀 AI 實戰 V4 Trend FORMATION Long [Hyperliquid] [{mode_label}] 啟動")
+    print(f"   SL={SL_ATR_MULT}×ATR | TP={TP_ATR_MULT}×ATR (R:R={TP_ATR_MULT/SL_ATR_MULT:.1f}:1)")
+    print(f"   Anti-chase: 跳過若 BTC 30min > {MAX_30MIN_PUMP_PCT*100:.1f}%")
+    print(f"   入場: ΔADX(25m)>+{ADX_RISING_THR} OR BBW expanding | Lee-Ready flow + breakout")
+    print(f"   Timeout={TIMEOUT_SECONDS//60}min | Trail=1×ATR | ActiveSignals={ACTIVE_LONG_SIGNALS}")
     print(f"   Fee: taker={FEE_RATE*100:.4f}% / maker={FEE_RATE_MAKER*100:.4f}%")
     print(f"   Regime緩存={REGIME_CACHE_TTL}s | ATR緩存={ATR_CACHE_TTL}s | Pos緩存={POSITIONS_CACHE_TTL}s")
     if not SIMULATION_MODE:
@@ -2240,7 +1971,7 @@ def main() -> None:
                          regime_signal=regime.get('regime_signal', 0),
                          mean_adx=regime.get('mean_adx', 0.0),
                          market_score=regime.get('market_score', 0.0),
-                         adx_mei=regime.get('adx_mei', 0.0),
+                         adx_mei=regime.get('adx_velocity', 0.0),  # [V4] reused field: ADX velocity
                          brake=bool(regime.get('brake', False)),
                          soft_brake=bool(regime.get('soft_brake', False)),
                          sim_mode=SIMULATION_MODE)
@@ -2274,55 +2005,30 @@ def main() -> None:
                 regime_signal  = regime.get('regime_signal', 0)
                 is_long_signal = regime_signal in ACTIVE_LONG_SIGNALS
 
-                # Sensor B: update regime direction history
-                global _regime_signal_history
-                _regime_signal_history.append(regime_signal)
-
                 _SIGNAL_LABEL = {0: "中性", +2: "趨勢多頭✅"}
                 if _current_state != _last_brake_state:
                     print(f"📡 Regime: {_SIGNAL_LABEL.get(regime_signal, '未知')} | "
                           f"啟用多頭訊號: {ACTIVE_LONG_SIGNALS}")
 
                 if is_long_signal:
-                    mean_adx = regime.get('mean_adx', 0)
-                    adx_mei  = regime.get('adx_mei', 0.0)
-
-                    # Sensor B: compute consecutive same-direction count
-                    _persist = 0
-                    for _r in reversed(list(_regime_signal_history)):
-                        if _r == regime_signal: _persist += 1
-                        else: break
-
-                    # MEI: top protection gate
-                    # 閾值放寬：-2.0（原 -0.8），避免 ADX 正常減速被誤判為頂部
-                    if adx_mei < -2.0:
-                        print(f"🔴 [MEI] 頂部確認={adx_mei:.2f}，跳過多頭（ADX={mean_adx:.1f}）")
-                        _last_brake_state = _current_state
-                        time.sleep(POSITION_CHECK_INTERVAL)
-                        continue
-                    elif adx_mei < -1.5:
-                        position_multiplier = 0.3
-                    elif adx_mei < -1.0:
-                        position_multiplier = 0.7
-                    else:
-                        position_multiplier = 1.0
-
-                    # Sensor B: progressive scaling
-                    _b_scale = SENSOR_B_SCALE.get(_persist, 1.0 if _persist >= 4 else 0.25)
-                    position_multiplier = min(position_multiplier, _b_scale)
-
-                    # [SOFT-DAILY] 1D 多資產日線結構不偏多時：軟降倉（× 0.5）
-                    _daily_bull       = regime.get('daily_bull', True)
-                    _daily_consensus  = regime.get('daily_consensus', 0)
-                    if not _daily_bull:
-                        position_multiplier *= 0.5
-                        print(f"  📉 [SOFT-DAILY] 1D共識={_daily_consensus:+d} → 倉位 × 0.5")
-
-                    _icon = ("🟠" if position_multiplier <= 0.3 else
-                             "🟡" if position_multiplier <= 0.7 else "🟢")
-                    print(f"{_icon} [Sensor B] 多頭 ADX={mean_adx:.1f} MEI={adx_mei:+.2f}"
-                          f" 連續{_persist}次 倉位={position_multiplier:.0%}"
-                          f"{'[SIM]' if SIMULATION_MODE else ''}")
+                    # [V4-MOMENTUM] Position multiplier simplified:
+                    #   - Sensor B (consecutive-regime ramp 0.25→1.0)  REMOVED
+                    #     Reason: scaled UP after trend ran for 12 cycles = late-entry magnifier.
+                    #   - MEI top protection gate (block when adx_mei < -2)  REMOVED
+                    #     Reason: was a band-aid for top-chasing entries; with formation entries
+                    #     + tight 1.2×ATR SL, "top protection" is structurally unnecessary.
+                    #   - SOFT-DAILY (× 0.5 when 1D not bullish)  REMOVED
+                    #     Reason: 1D consensus has ~0 correlation with fwd 30m return on majors.
+                    #   - Cascade SL freeze  REMOVED
+                    #     Reason: cascade SL was caused by top-chasing entries; new trend-formation
+                    #     entries with 1.2×ATR SL have decorrelated SL events.
+                    position_multiplier = 1.0
+                    mean_adx        = regime.get('mean_adx', 0)
+                    adx_velocity    = regime.get('adx_velocity', 0)
+                    btc_30m_pump    = regime.get('btc_30m_pump', 0)
+                    print(f"🟢 [V4] 趨勢多頭 ADX={mean_adx:.1f} ΔADX25m={adx_velocity:+.2f}"
+                          f" BTC30m={btc_30m_pump*100:+.2f}%"
+                          f" {'[SIM]' if SIMULATION_MODE else ''}")
 
                     if len(positions) >= MAX_CONCURRENT_POSITIONS:
                         print(f"⛔ 倉位已達上限 {MAX_CONCURRENT_POSITIONS}，跳過本輪掃描")
@@ -2330,17 +2036,7 @@ def main() -> None:
                         time.sleep(POSITION_CHECK_INTERVAL)
                         continue
 
-                    now = time.time()
-                    recent_sl_times[:] = [t for t in recent_sl_times
-                                          if now - t < CASCADE_SL_WINDOW]
-                    if len(recent_sl_times) >= CASCADE_SL_TRIGGER:
-                        print(f"⛔ SL 連環觸發保護：{len(recent_sl_times)} 筆 SL 在 "
-                              f"{CASCADE_SL_WINDOW}s 內，暫停入場")
-                        _last_brake_state = _current_state
-                        time.sleep(POSITION_CHECK_INTERVAL)
-                        continue
-
-                    # Sniper priority sort: collect all signals, sort by acceleration
+                    # Lee-Ready flow scan: collect signals, prioritise sniper (flow>0 + accel>0 + imbal>+0.15).
                     _prescan = []
                     for s in target_coins:
                         try:
@@ -2352,7 +2048,6 @@ def main() -> None:
                             pass
                         time.sleep(0.3)
 
-                    # Snipers first (highest acceleration), then regular is_strong
                     _prescan.sort(key=lambda x: (not x[5], -x[4]))
                     _sniper_coins = [r[0] for r in _prescan if r[5]]
                     if _sniper_coins:
