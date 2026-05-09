@@ -240,7 +240,9 @@ MAX_NOTIONAL_PER_TRADE = 40.0
 
 # [V4-MOMENTUM] R:R reversed: TP=3×ATR / SL=1.2×ATR → 2.5:1 (was 0.875:1)
 # Old (3.5/4.0) requires 53% WR breakeven; new (3.0/1.2) only needs 28.6% WR.
-NET_FLOW_SIGMA = 1.2
+# [V4] NET_FLOW_SIGMA 1.2 → 1.0 — z-score 路徑放鬆，搭配 sniper 高品質排序前置，可多 capture
+# 一些剛起動但未到 sniper 級別（imbalance < 0.15）的 setup。
+NET_FLOW_SIGMA = 1.0
 TP_ATR_MULT    = 3.0
 SL_ATR_MULT    = 1.2
 
@@ -564,7 +566,12 @@ def get_market_metrics(symbol: str) -> tuple:
                 np.maximum(abs(df['h'] - df['c'].shift(1)), abs(df['l'] - df['c'].shift(1)))
             )
             atr         = df['tr'].rolling(14, min_periods=1).mean().iloc[-1]
-            is_volatile = (atr / df['c'].iloc[-1]) > 0.0015
+            # [V4] Threshold lowered 0.0015 → 0.0010 (0.15% → 0.10% ATR%).
+            # Reason: with TP=3×ATR and RT cost ≈ 0.18%, we need ATR% > ~0.06% to be
+            # profitable post-fee. The downstream "tp profit < 0.3%" guard at line ~1846
+            # already enforces a stricter floor. Old 0.15% was overshooting and killed
+            # candidates in normal majors regimes (5m ATR ≈ 0.07-0.12%).
+            is_volatile = (atr / df['c'].iloc[-1]) > 0.0010
             if pd.isna(atr) or atr == 0:
                 return None, False
             _atr_cache[symbol] = {'atr': atr, 'is_volatile': is_volatile, 'ts': time.time()}
@@ -740,15 +747,20 @@ def check_symbol_trend(symbol: str) -> dict:
             dx  = np.where((pdi + ndi) > 0, 100.0 * np.abs(pdi - ndi) / (pdi + ndi), 0.0)
         adx_arr = pd.Series(dx).ewm(alpha=1.0 / win, adjust=False).mean().values
 
-        # [V4] Formation signals
+        # [V4] Formation signals — symbol level looser than regime level.
+        # Symbol passes if EITHER condition signals momentum forming:
+        #   (a) ADX rising  (>+0.3 over 25min — note: regime threshold is +0.5)
+        #   (b) Near 20-bar high (within 0.2% — was 0.1%; loosened to capture grind-ups)
+        # Plus mandatory protection: not_extended AND di_ok.
         adx_now      = float(adx_arr[-1])
         adx_5bar_ago = float(adx_arr[-6]) if len(adx_arr) >= 6 else adx_now
-        adx_rising   = (adx_now - adx_5bar_ago) > ADX_RISING_THR
+        SYM_ADX_RISING_THR = 0.3   # symbol level: looser than ADX_RISING_THR (regime=0.5)
+        adx_rising   = (adx_now - adx_5bar_ago) > SYM_ADX_RISING_THR
 
         # Breakout detector: current close near or above 20-bar high
         n_break = min(20, len(closes) - 1)
         recent_high = float(np.max(highs[-n_break:-1])) if n_break > 1 else closes[-1]
-        breakout    = closes[-1] >= recent_high * 0.999    # within 0.1% of new high
+        breakout    = closes[-1] >= recent_high * 0.998    # within 0.2% of new high
 
         # Anti-chase: this symbol's 30min pump (6 bars on 5m chart)
         sym_30m_pump = float(closes[-1] / closes[-7] - 1) if len(closes) > 7 else 0.0
@@ -757,7 +769,19 @@ def check_symbol_trend(symbol: str) -> dict:
         di_spread   = float(pdi[-1]) - float(ndi[-1])
         di_ok       = di_spread >= 0.0   # PDI weakly dominant — relaxed from old +3.0/+5.0
 
-        is_long_ok = adx_rising and breakout and not_extended and di_ok
+        # OR semantic on (adx_rising / breakout); AND on protections (not_extended, di_ok)
+        formation_ok = adx_rising or breakout
+        is_long_ok = formation_ok and not_extended and di_ok
+
+        # Build a compact reason tag — first failing gate wins (most useful for debug funnel)
+        if not formation_ok:
+            tag = "no_formation"
+        elif not not_extended:
+            tag = "extended"
+        elif not di_ok:
+            tag = "di_neg"
+        else:
+            tag = "ok"
 
         result = {
             'is_long_ok':   is_long_ok,
@@ -767,7 +791,7 @@ def check_symbol_trend(symbol: str) -> dict:
             'breakout':     breakout,
             'sym_30m_pump': round(sym_30m_pump * 100, 2),
             'reason':       (
-                f"ΔADX={adx_now-adx_5bar_ago:+.1f} brk={int(breakout)} "
+                f"{tag} ΔADX={adx_now-adx_5bar_ago:+.1f} brk={int(breakout)} "
                 f"30m={sym_30m_pump*100:+.2f}% DI={di_spread:+.1f}"
             ),
         }
@@ -1673,17 +1697,19 @@ def manage_long_positions(regime: dict = None) -> None:
 # ==========================================
 def execute_live_long(symbol: str, net_flow: float, current_price: float,
                       is_strong: bool, atr, is_volatile: bool,
-                      regime: dict = None, position_multiplier: float = 1.0) -> None:
+                      regime: dict = None, position_multiplier: float = 1.0) -> str:
     """
     Size and execute a long entry via IOC limit order.
+
+    Returns a status string indicating which gate rejected (or 'TRADED' / 'EXEC_FAIL').
+    Used by main loop to build a scan-funnel summary.
+
     [HL-7]  No exchange-native TP/SL call. TP/SL enforced locally via
             manage_long_positions(). (HL has no trading_stop equivalent.)
     [HL-9]  set_leverage: generalized error handling (removed Bybit codes).
     [HL-15] IOC params: removed 'positionIdx': 0.
     [HL-16] Leverage errors: generalized (removed 110043/110026 guards).
     [FIX-SIM] Sim mode: uses sim_open_long() instead of exchange order.
-    Args:
-        position_multiplier: sizing scale factor from Sensor B + MEI.
     """
     _r                = regime or {}
     regime_signal_tag = _r.get('regime_signal', 0)
@@ -1692,29 +1718,31 @@ def execute_live_long(symbol: str, net_flow: float, current_price: float,
 
     if symbol in cooldown_tracker:
         if time.time() < cooldown_tracker[symbol]:
-            return
+            return 'cooldown'
         else:
             del cooldown_tracker[symbol]
 
     if atr is None or atr == 0 or current_price == 0:
-        return
-    if not (is_strong and is_volatile and symbol not in positions):
-        return
+        return 'no_atr'
+    if symbol in positions:
+        return 'already_held'
+    if not is_strong:
+        return 'lee_weak'
+    if not is_volatile:
+        return 'low_vol'
 
     # [V4-MOMENTUM] Regime-level anti-chase: if BTC has already pumped > MAX_30MIN_PUMP_PCT,
     # we are too late. The regime detector already enforces this, but we re-check here
     # because by the time Lee-Ready triggers per-symbol, BTC may have moved further.
     _btc_pump = (regime or {}).get('btc_30m_pump', 0.0)
     if _btc_pump > MAX_30MIN_PUMP_PCT:
-        logger.debug(f"⛔ [Anti-chase] {symbol} BTC 30m={_btc_pump*100:+.2f}% > "
-                     f"{MAX_30MIN_PUMP_PCT*100:.1f}%，跳過")
-        return
+        return 'btc_pumped'
 
     # ── [V4] Symbol-level formation gate (ADX rising + breakout + symbol not extended) ──
     _trend = check_symbol_trend(symbol)
     if not _trend.get('is_long_ok'):
-        logger.debug(f"⛔ [Symbol-gate] {symbol} formation 未達: {_trend.get('reason', 'n/a')}")
-        return
+        # Stash the reason on the dict so caller can surface it (less spammy than printing)
+        return f"sym_gate:{_trend.get('reason', 'n/a')}"
     print(f"✅ [Symbol-gate] {symbol} formation: {_trend.get('reason', 'n/a')}")
 
     # Tier 2 auto-scale
@@ -1753,14 +1781,13 @@ def execute_live_long(symbol: str, net_flow: float, current_price: float,
                         }
                         print(f"🔄 [DUPCHECK] 已補回 {symbol} 至本地 positions dict")
                         break
-                return
+                return 'dupcheck_held'
         except Exception as e:
             logger.warning(f"⚠️ [DUPCHECK] {symbol} 查詢失敗，繼續執行: {e}")
 
     # Hard position cap
     if len(positions) >= MAX_CONCURRENT_POSITIONS:
-        logger.debug(f"⛔ {symbol} 倉位已達上限 {MAX_CONCURRENT_POSITIONS}")
-        return
+        return 'pos_cap'
 
     # [V4-MOMENTUM] Cascade SL protection REMOVED — see strategy parameters block.
     cancel_all_hl(symbol)
@@ -1775,11 +1802,11 @@ def execute_live_long(symbol: str, net_flow: float, current_price: float,
 
     amount = float(exchange.amount_to_precision(symbol, trade_val / current_price))
     if amount < exchange.markets[symbol]['limits']['amount'].get('min', 0):
-        return
+        return 'below_min_amt'
 
     ioc_p = get_3_layer_avg_price(symbol, 'asks') or current_price
     if amount * ioc_p < MIN_NOTIONAL:
-        return
+        return 'below_min_notional'
 
     # [HL-9] Leverage — generalized error handling (no Bybit-specific codes)
     if not SIMULATION_MODE:
@@ -1794,7 +1821,7 @@ def execute_live_long(symbol: str, net_flow: float, current_price: float,
         actual_amount, actual_price = sim_open_long(symbol, amount, ioc_p)
         if actual_amount == 0:
             print(f"⏩ [SIM] {symbol} 餘額不足，跳過。")
-            return
+            return 'insufficient_bal'
     else:
         try:
             # [HL-15] Removed positionIdx (Bybit hedge-mode specific)
@@ -1824,16 +1851,16 @@ def execute_live_long(symbol: str, net_flow: float, current_price: float,
             if actual_amount == 0:
                 print(f"⏩ {symbol} IOC 未成交，撤單退出。")
                 cancel_all_hl(symbol)
-                return
+                return 'ioc_unfilled'
 
         except ccxt.RateLimitExceeded:
             # [HL-14] Generic rate-limit handler
             logger.warning(f"⏳ {symbol} 入場遭遇 Rate Limit，等待後重試")
             time.sleep(5)
-            return
+            return 'rate_limit'
         except Exception as e:
             logger.error(f"❌ {symbol} 做多執行失敗: {e}")
-            return
+            return 'exec_fail'
 
     # ── Calculate TP/SL ──
     tp_p = float(exchange.price_to_precision(symbol, actual_price + TP_ATR_MULT * atr))
@@ -1853,7 +1880,7 @@ def execute_live_long(symbol: str, net_flow: float, current_price: float,
             except Exception as e:
                 logger.error(f"❌ {symbol} 緊急平倉失敗: {e}")
             cancel_all_hl(symbol)
-        return
+        return 'tp_too_small'
 
     # [HL-7] No exchange-native TP/SL call here.
     #         Bybit used: private_post_v5_position_trading_stop(...)
@@ -1924,6 +1951,8 @@ def execute_live_long(symbol: str, net_flow: float, current_price: float,
             )
         except Exception as e:
             logger.warning(f"⚠️ Telegram通知發送失敗: {e}")
+
+    return 'TRADED'
 
 
 # ==========================================
@@ -2043,24 +2072,57 @@ def main() -> None:
                             flow, last_p, is_strong, accel, imbal = apply_lee_ready_long_logic(s)
                             if last_p > 0:
                                 _is_sniper = (flow > 0 and accel > 0 and imbal > 0.15)
-                                _prescan.append((s, flow, last_p, is_strong, accel, _is_sniper))
+                                _prescan.append((s, flow, last_p, is_strong, accel, imbal, _is_sniper))
                         except Exception:
                             pass
                         time.sleep(0.3)
 
-                    _prescan.sort(key=lambda x: (not x[5], -x[4]))
-                    _sniper_coins = [r[0] for r in _prescan if r[5]]
+                    _prescan.sort(key=lambda x: (not x[6], -x[4]))
+                    _sniper_coins = [r[0] for r in _prescan if r[6]]
                     if _sniper_coins:
                         print(f"🎯 Sniper 優先入場排序: {_sniper_coins}")
 
-                    for s, flow, last_p, is_strong, accel, _ in _prescan:
+                    # [V4-DIAG] Build scan funnel so user can see WHY no trade fires.
+                    _funnel = {
+                        'total':       len(target_coins),
+                        'lee_strong':  sum(1 for x in _prescan if x[3]),
+                        'lee_sniper':  len(_sniper_coins),
+                    }
+                    _reasons = {}                      # reason → count
+                    _examples = {}                     # reason → up-to-2 example symbols
+                    _traded_syms = []
+                    for s, flow, last_p, is_strong, accel, imbal, _ in _prescan:
                         try:
                             atr, is_v = get_market_metrics(s)
-                            execute_live_long(s, flow, last_p, is_strong,
-                                             atr, is_v, regime=regime,
-                                             position_multiplier=position_multiplier)
-                        except Exception:
+                            status = execute_live_long(s, flow, last_p, is_strong,
+                                                       atr, is_v, regime=regime,
+                                                       position_multiplier=position_multiplier)
+                            status = status or 'no_status'
+                            if status == 'TRADED':
+                                _traded_syms.append(s)
+                            else:
+                                # Group sym_gate sub-reasons under one bucket but keep the detail.
+                                _key = status.split(':', 1)[0] if ':' in status else status
+                                _reasons[_key] = _reasons.get(_key, 0) + 1
+                                if len(_examples.get(_key, [])) < 2:
+                                    _examples.setdefault(_key, []).append(
+                                        f"{s.split('/')[0]}({status.split(':',1)[1]})"
+                                        if ':' in status else s.split('/')[0])
+                        except Exception as _ie:
+                            _reasons['exception'] = _reasons.get('exception', 0) + 1
+                            logger.debug(f"scan loop exception {s}: {_ie}")
                             continue
+                    # Print funnel — only when there's something to show
+                    if _prescan:
+                        _funnel_parts = [f"scanned {_funnel['total']}",
+                                         f"flow_strong {_funnel['lee_strong']}",
+                                         f"sniper {_funnel['lee_sniper']}",
+                                         f"traded {len(_traded_syms)}"]
+                        print("🔬 [Scan] " + " | ".join(_funnel_parts))
+                        if _reasons:
+                            for k in sorted(_reasons, key=lambda x: -_reasons[x])[:5]:
+                                ex = ', '.join(_examples.get(k, [])[:2])
+                                print(f"      ↳ {k}: {_reasons[k]}  [{ex}]")
 
                 else:
                     if _current_state != _last_brake_state:
