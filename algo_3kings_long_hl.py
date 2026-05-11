@@ -5,8 +5,9 @@
   Strategy: V5-EV Anti-Peak Long (Lee-Ready alpha + peak-avoidance gates)
     - Entry alpha       : Lee-Ready Net Flow z>1σ OR sniper (flow+accel+imbal>0.15)
     - Regime gate       : Anti-peak 5m (BTC 5m<+0.3%) + Anti-chase 30m (BTC 30m<+1.5%)
-                          + PDI dominant + not high-vol + not bear (5 hard vetos only)
-    - Symbol gate       : Anti-peak 5m + Anti-chase 30m (per-symbol) + +DI≥-DI
+                          + not high-vol + not bear (4 hard vetos; +DI/-DI removed —
+                          WFA on 1H/4H BTC/ETH/SOL showed zero directional predictive power)
+    - Symbol gate       : Anti-peak 5m + Anti-chase 30m (per-symbol; +DI/-DI removed)
     - Risk              : TP=1.5×ATR / SL=1.0×ATR (R:R=1.5:1, breakeven WR=40%)
                           + 30min hard timeout + BE push @+0.7×ATR + 0.6×ATR trail
     - Memory            : Dynamic 24h ban after 3 consecutive SL losses
@@ -729,20 +730,19 @@ def get_live_positions_cached() -> list:
 # ==========================================
 def check_symbol_trend(symbol: str) -> dict:
     """
-    [V5-EV] Per-symbol gate — REPLACED V4's "ADX-rising / breakout" requirement
-            with a pure peak-avoidance filter.
+    [V5.1-EV] Per-symbol gate — 2 peak-avoidance filters only.
 
-    Why removed:
-      Backtest on production regime data: setups with btc_5m > +0.3% + ADX rising
-      had fwd 30m gross EV = -0.79%, WR = 3%. The ADX↑/breakout requirement was
-      systematically routing entries to local tops where MMs fade.
+    Evidence base:
+      • ADX↑ / breakout requirement (V4): fwd 30m gross EV = -0.79%, WR = 3% → removed
+      • +DI/-DI direction gate (V5.0):    WFA on 1H/4H BTC/ETH/SOL shows zero
+        directional predictive power (UP correct ≤50%, p<0.05 rate ≤4%) → removed
 
-    What V5 keeps:
+    What remains:
       • not_extended_30m  (symbol's own 30m pump < 2.25%) — anti-chase per-symbol
       • not_at_peak_5m    (symbol's own 5m pump < 0.8%)   — anti-peak per-symbol
-      • di_ok             (+DI ≥ -DI by ≥0)               — light directional bias
 
-    What does the heavy lifting now: Lee-Ready net flow z-score / sniper signal.
+    What does the heavy lifting: Lee-Ready net flow z-score / sniper signal.
+    DI spread is still computed and logged for monitoring; NOT a gate.
     Cache: 60 seconds.
     """
     cached = _symbol_trend_cache.get(symbol)
@@ -790,18 +790,16 @@ def check_symbol_trend(symbol: str) -> dict:
         sym_5m_pump  = float(closes[-1] / closes[-2] - 1) if len(closes) > 2 else 0.0
         not_at_peak  = sym_5m_pump < MAX_5MIN_PUMP_SYM           # default 0.8% on alts
 
+        # DI spread: computed for monitoring/logging only — NOT a gate (WFA: zero predictive power)
         di_spread   = float(pdi[-1]) - float(ndi[-1])
-        di_ok       = di_spread >= 0.0   # PDI weakly dominant
 
-        is_long_ok  = not_extended and not_at_peak and di_ok
+        is_long_ok  = not_extended and not_at_peak
 
         # First failing gate wins for the funnel reason tag
         if not not_extended:
             tag = "extended_30m"
         elif not not_at_peak:
             tag = "peak_5m"
-        elif not di_ok:
-            tag = "di_neg"
         else:
             tag = "ok"
 
@@ -813,7 +811,7 @@ def check_symbol_trend(symbol: str) -> dict:
             'sym_30m_pump': round(sym_30m_pump * 100, 2),
             'reason':       (
                 f"{tag} 5m={sym_5m_pump*100:+.2f}% 30m={sym_30m_pump*100:+.2f}% "
-                f"DI={di_spread:+.1f}"
+                f"DI={di_spread:+.1f}[info]"
             ),
         }
         _symbol_trend_cache[symbol] = {'data': result, 'ts': time.time()}
@@ -1037,9 +1035,15 @@ def get_btc_regime_v3_fast() -> dict:
             btc_5m_pump = float(btc_arr[-1] / btc_arr[-2] - 1)
         is_at_peak = btc_5m_pump > MAX_5MIN_PUMP_PCT
 
-        # Light direction confirmation: PDI > NDI (don't enter while NDI dominates)
-        # Threshold relaxed from -3 to -1 (was over-restrictive, blocked 80% of valid setups)
-        pdi_dominant = (mean_ndipdi < -1.0)
+        # [V5.1-REMOVED] pdi_dominant / L5-NDIDominant gate REMOVED.
+        # WFA research (Binance 1H+4H, BTC/ETH/SOL, 2022–2026) showed +DI/-DI has
+        # zero directional predictive power at these timeframes:
+        #   UP regime avg next return = negative (should be positive)
+        #   DOWN regime avg next return = positive (should be negative)
+        #   p<0.05 hit rate across all 3 experiment versions: ≤ 4% (threshold: ≥ 60%)
+        # The gate was blocking entries without any EV justification.
+        # NDI-PDI is still computed and logged for monitoring; it is NOT a gate.
+        pdi_dominant = True   # always pass — kept as variable to avoid log/CSV refactor
 
         # Composite score kept for monitoring/logging only — NOT used as an entry gate
         def _norm(val, lo, hi):
@@ -1064,17 +1068,14 @@ def get_btc_regime_v3_fast() -> dict:
         if bull_votes > n_assets // 2:
             is_bear = False
 
-        # [V5-EV] DECISION LOGIC — "NOT at peak" + light directional bias.
-        # Backtest verdict: trend-FORMATION gates (ADX rising / breakout) were -EV
-        # because they fire AFTER MMs have already absorbed the move. We replace
-        # them with PEAK AVOIDANCE gates and let Lee-Ready (per-symbol flow) be
-        # the entry alpha.
-        # Emit +2 only if:
-        #   1. Not in confirmed bear (>50% majors -3%/7d & macro ADX>30) — hard veto
-        #   2. Not high-vol panic (wide stops bleed) — hard veto
-        #   3. Not overextended at 30m horizon (BTC pump < 1.5% in 30min)
-        #   4. Not spiking right now (BTC pump < 0.3% in 5min) — strongest -EV remover
-        #   5. PDI not strongly dominated by NDI (light directional bias)
+        # [V5.1-EV] DECISION LOGIC — 4 hard vetos only, no DI direction gate.
+        # Gates (evidence-backed):
+        #   L1. Confirmed macro bear (>50% majors 7d < -3% & ADX>30)
+        #   L2. High-vol panic (ATR% at 90th pct — wide stops bleed capital)
+        #   L3. BTC overextended 30m (pump > 1.5%) — anti-chase
+        #   L4. BTC at immediate peak 5m (pump > 0.3%) — strongest single -EV remover
+        # Removed:
+        #   L5. PDI dominant (NDI-PDI < -1.0) — WFA shows zero predictive power
         regime_signal = 0
         _block_reason = []
 
@@ -1088,9 +1089,6 @@ def get_btc_regime_v3_fast() -> dict:
         elif is_at_peak:
             _block_reason.append(f"L4-AtPeak5m: BTC 5m={btc_5m_pump*100:+.2f}%"
                                  f" > {MAX_5MIN_PUMP_PCT*100:.2f}% (anti-peak)")
-        elif not pdi_dominant:
-            _block_reason.append(
-                f"L5-NDIDominant: NDI-PDI={mean_ndipdi:+.2f} (need < -1.0)")
         else:
             regime_signal = +2
 
@@ -1148,7 +1146,7 @@ def get_btc_regime_v3_fast() -> dict:
             f"{btc_5m_pump*100:+.2f}%  (max {MAX_5MIN_PUMP_PCT*100:.2f}% else block)",
             f"{btc_30m_pump*100:+.2f}%  (max {MAX_30MIN_PUMP_PCT*100:.1f}% else block)", '',
             f"{mean_ndi:.2f}", f"{mean_pdi:.2f}",
-            f"{mean_ndipdi:+.2f}  (need <-1.0 for +2)", '',
+            f"{mean_ndipdi:+.2f}  [info only — WFA: no predictive power]", '',
             f"{'ON 🐻' if is_bear else 'OFF'}", f"{bear_votes}/{n_assets}", f"{bull_votes}/{n_assets}", '',
             f"{signal_names.get(regime_signal, '無信號')}", status_text,
         ]
