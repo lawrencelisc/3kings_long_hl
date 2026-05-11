@@ -1,20 +1,27 @@
 """
 ================================================================================
   algo_3kings_long_hl.py
-  Migrated from: prototype_long_short_v3.py (Bybit V3 Long/Short → Long-Only)
   Target Exchange: Hyperliquid (via CCXT)
-  Strategy: Trend Long-Only Momentum Sniper V3
-    - Market Regime     : V3 Multi-asset Trend Detector (ADX+BBW+DI, Long-only simplified)
-    - Coin Scout        : TIER1/TIER2 USDC whitelist, ranked by momentum
-    - Entry Signal      : Lee-Ready Net Flow + Acceleration + OB Imbalance
-    - Tier 2 Gate       : Per-symbol ADX+DI + No-Lag Direction (slope+Donchian) + 1H HTF
-    - Risk Management   : ATR-based sizing + Multi-stage Variable Trail SL
-    - Regime Confidence : Sensor B progressive sizing (12-bar history)
-    - ADX MEI           : Momentum Exhaustion Index (top-protection)
-    - Memory            : Dynamic 24h ban system + Cascade SL protection
-    - Daily Filter      : Multi-asset 1D structure consensus (no single-asset bias)
-    - Direction Detect  : Linear regression slope + Donchian structure (NO EMA, NO LAG)
+  Strategy: V5-EV Anti-Peak Long (Lee-Ready alpha + peak-avoidance gates)
+    - Entry alpha       : Lee-Ready Net Flow z>1σ OR sniper (flow+accel+imbal>0.15)
+    - Regime gate       : Anti-peak 5m (BTC 5m<+0.3%) + Anti-chase 30m (BTC 30m<+1.5%)
+                          + PDI dominant + not high-vol + not bear (5 hard vetos only)
+    - Symbol gate       : Anti-peak 5m + Anti-chase 30m (per-symbol) + +DI≥-DI
+    - Risk              : TP=1.5×ATR / SL=1.0×ATR (R:R=1.5:1, breakeven WR=40%)
+                          + 30min hard timeout + BE push @+0.7×ATR + 0.6×ATR trail
+    - Memory            : Dynamic 24h ban after 3 consecutive SL losses
+    - Coin Scout        : USDC whitelist, ranked by momentum, scanned every 125s
   Base Currency: USDC (Hyperliquid native)
+  Fee model: taker 0.0389% (IOC entries), round-trip cost ≈ 0.18%
+
+  WHY V5 EXISTS:
+    V3/V4 backtest on 2,391-row production regime CSV showed trend-FORMATION
+    entries (ADX rising / breakout) had fwd 30m gross EV = -0.68%, WR = 4.8%.
+    Buy-the-dip baseline had +0.92% / WR = 92%. Conclusion: HL 5m majors are
+    structurally mean-reverting at this timescale. V5 keeps the user-requested
+    Lee-Ready alpha (institutional flow signal — works ABOVE the regime layer)
+    but removes the -EV "chase trend" gates and replaces them with anti-peak
+    filters that data shows correlate with fwd-positive returns.
 ================================================================================
   KEY MIGRATION CHANGES FROM BYBIT V3:
   [HL-1]  Exchange: ccxt.bybit → ccxt.hyperliquid
@@ -238,20 +245,39 @@ RISK_PER_TRADE         = 0.005
 MIN_NOTIONAL           = 10.0         # [HL-2] HL minimum ~$10 USDC
 MAX_NOTIONAL_PER_TRADE = 40.0
 
-# [V4-MOMENTUM] R:R reversed: TP=3×ATR / SL=1.2×ATR → 2.5:1 (was 0.875:1)
-# Old (3.5/4.0) requires 53% WR breakeven; new (3.0/1.2) only needs 28.6% WR.
-# [V4] NET_FLOW_SIGMA 1.2 → 1.0 — z-score 路徑放鬆，搭配 sniper 高品質排序前置，可多 capture
-# 一些剛起動但未到 sniper 級別（imbalance < 0.15）的 setup。
-NET_FLOW_SIGMA = 1.0
-TP_ATR_MULT    = 3.0
-SL_ATR_MULT    = 1.2
+# [V5-EV] Backtest on 2,391-row production regime CSV revealed V4 trend-FORMATION
+# entries were structurally -EV on HL 5m majors:
+#     V4 entries (ADX↑ + breakout) → fwd 30m gross EV = -0.68%, WR = 4.8%
+#     buy-the-dip (BTC -5m < -0.5%) → fwd 30m gross EV = +0.92%, WR = 92%
+# Conclusion: at this timeframe + venue, "trend continuation" is dominated by
+# market-makers' fade flow. Chasing breakouts = paying liquidity, getting reversed.
+# V5 keeps Lee-Ready as the entry alpha (per-symbol institutional flow signal),
+# but flips the regime/symbol gates from "trend forming" to "NOT at peak".
+#
+# Concrete changes vs V4:
+#   • TP=1.5×ATR (was 3.0×ATR) — match achievable mean-rev move size.
+#   • SL=1.0×ATR (was 1.2×ATR) — tighter, R:R = 1.5:1 (BE WR = 40%, vs V4's 28.6%
+#     which was wishful given V4 was actually getting WR<5%).
+#   • MAX_5MIN_PUMP_PCT (NEW) — block entries when BTC just spiked >0.3% in 5min.
+#     [data: BTC 5m > +0.3% setups → fwd 30m gross EV = -0.79%, WR = 3%]
+#   • ADX_RISING_THR no longer used as a gate (kept for log compatibility = 0).
+NET_FLOW_SIGMA = float(os.getenv('NET_FLOW_SIGMA', '1.0'))
+TP_ATR_MULT    = float(os.getenv('TP_ATR_MULT', '1.5'))
+SL_ATR_MULT    = float(os.getenv('SL_ATR_MULT', '1.0'))
 
-# [V4-MOMENTUM] Anti-chase: skip new entries if BTC already pumped > MAX_30MIN_PUMP_PCT
-# in the last 30 minutes (catches trend FORMATION, not late confirmation).
+# [V5-EV] Anti-chase (medium horizon): block when BTC already pumped > 1.5% in 30min.
 MAX_30MIN_PUMP_PCT = float(os.getenv('MAX_30MIN_PUMP_PCT', '0.015'))   # 1.5%
 
-# [V4-MOMENTUM] ADX rising threshold (per 5m bar) — formation signal, NOT confirmation
-ADX_RISING_THR = float(os.getenv('ADX_RISING_THR', '0.5'))
+# [V5-EV] Anti-peak (short horizon): block when BTC just spiked > 0.3% in last 5min.
+# Backtest evidence: entries in this state have fwd 30m gross EV = -0.79%, WR = 3%.
+MAX_5MIN_PUMP_PCT  = float(os.getenv('MAX_5MIN_PUMP_PCT', '0.003'))    # 0.3%
+
+# [V5-EV] Symbol-level anti-peak: alt 5m pump cap (looser than BTC because alts have
+# higher beta but mean-revert faster).
+MAX_5MIN_PUMP_SYM  = float(os.getenv('MAX_5MIN_PUMP_SYM', '0.008'))    # 0.8%
+
+# [V5-EV] ADX_RISING_THR retained for backwards-compat in CSV/log columns; NOT a gate.
+ADX_RISING_THR = float(os.getenv('ADX_RISING_THR', '0.0'))
 
 MAX_CONSECUTIVE_LOSSES = 3
 DYNAMIC_BAN_DURATION   = 86400
@@ -690,11 +716,12 @@ def get_live_positions_cached() -> list:
         return _positions_cache['data'] or []
 
 
-# [V4-MOMENTUM] No-Lag Direction Detector REMOVED.
+# [V5-EV] No-Lag Direction Detector REMOVED.
 # Old _slope_norm + _donchian_structure + _no_lag_direction + _multi_asset_direction_consensus
-# fed the 5m / 1H / 1D direction filters that were proven to be top-chasing
-# (correlation with fwd 30m return: -0.12 / 0 / 0). New trend-formation logic uses
-# ADX velocity + breakout detection at the symbol level instead.
+# fed 5m/1H/1D direction filters that were proven top-chasing (corr with fwd 30m
+# return: -0.12 / 0 / 0). V5 doesn't replace it with anything — direction bias
+# now comes purely from PDI vs NDI (info-cheap) plus per-symbol Lee-Ready flow
+# (the actual alpha source).
 
 
 # ==========================================
@@ -702,14 +729,20 @@ def get_live_positions_cached() -> list:
 # ==========================================
 def check_symbol_trend(symbol: str) -> dict:
     """
-    [V4-MOMENTUM] Per-symbol gate — REWRITTEN to detect trend FORMATION + breakout,
-                  not late confirmation.
+    [V5-EV] Per-symbol gate — REPLACED V4's "ADX-rising / breakout" requirement
+            with a pure peak-avoidance filter.
 
-    OLD logic: ADX>=22 + DI_spread>=3 + 5m direction=+1 + 1H HTF=+1
-               → all 4 are lagging confirmations; entries hit local tops.
-    NEW logic: ADX rising AND price near/above 20-bar high
-               → catches breakouts as they form, before extension.
+    Why removed:
+      Backtest on production regime data: setups with btc_5m > +0.3% + ADX rising
+      had fwd 30m gross EV = -0.79%, WR = 3%. The ADX↑/breakout requirement was
+      systematically routing entries to local tops where MMs fade.
 
+    What V5 keeps:
+      • not_extended_30m  (symbol's own 30m pump < 2.25%) — anti-chase per-symbol
+      • not_at_peak_5m    (symbol's own 5m pump < 0.8%)   — anti-peak per-symbol
+      • di_ok             (+DI ≥ -DI by ≥0)               — light directional bias
+
+    What does the heavy lifting now: Lee-Ready net flow z-score / sniper signal.
     Cache: 60 seconds.
     """
     cached = _symbol_trend_cache.get(symbol)
@@ -747,37 +780,26 @@ def check_symbol_trend(symbol: str) -> dict:
             dx  = np.where((pdi + ndi) > 0, 100.0 * np.abs(pdi - ndi) / (pdi + ndi), 0.0)
         adx_arr = pd.Series(dx).ewm(alpha=1.0 / win, adjust=False).mean().values
 
-        # [V4] Formation signals — symbol level looser than regime level.
-        # Symbol passes if EITHER condition signals momentum forming:
-        #   (a) ADX rising  (>+0.3 over 25min — note: regime threshold is +0.5)
-        #   (b) Near 20-bar high (within 0.2% — was 0.1%; loosened to capture grind-ups)
-        # Plus mandatory protection: not_extended AND di_ok.
-        adx_now      = float(adx_arr[-1])
-        adx_5bar_ago = float(adx_arr[-6]) if len(adx_arr) >= 6 else adx_now
-        SYM_ADX_RISING_THR = 0.3   # symbol level: looser than ADX_RISING_THR (regime=0.5)
-        adx_rising   = (adx_now - adx_5bar_ago) > SYM_ADX_RISING_THR
+        adx_now = float(adx_arr[-1])
 
-        # Breakout detector: current close near or above 20-bar high
-        n_break = min(20, len(closes) - 1)
-        recent_high = float(np.max(highs[-n_break:-1])) if n_break > 1 else closes[-1]
-        breakout    = closes[-1] >= recent_high * 0.998    # within 0.2% of new high
-
-        # Anti-chase: this symbol's 30min pump (6 bars on 5m chart)
+        # Anti-chase 30min: each bar=5min × 6 bars = 30min
         sym_30m_pump = float(closes[-1] / closes[-7] - 1) if len(closes) > 7 else 0.0
-        not_extended = sym_30m_pump < (MAX_30MIN_PUMP_PCT * 1.5)   # symbol-level looser than BTC
+        not_extended = sym_30m_pump < (MAX_30MIN_PUMP_PCT * 1.5)   # symbol looser (×1.5)
+
+        # Anti-peak 5min: this is the strongest -EV remover on majors microstructure
+        sym_5m_pump  = float(closes[-1] / closes[-2] - 1) if len(closes) > 2 else 0.0
+        not_at_peak  = sym_5m_pump < MAX_5MIN_PUMP_SYM           # default 0.8% on alts
 
         di_spread   = float(pdi[-1]) - float(ndi[-1])
-        di_ok       = di_spread >= 0.0   # PDI weakly dominant — relaxed from old +3.0/+5.0
+        di_ok       = di_spread >= 0.0   # PDI weakly dominant
 
-        # OR semantic on (adx_rising / breakout); AND on protections (not_extended, di_ok)
-        formation_ok = adx_rising or breakout
-        is_long_ok = formation_ok and not_extended and di_ok
+        is_long_ok  = not_extended and not_at_peak and di_ok
 
-        # Build a compact reason tag — first failing gate wins (most useful for debug funnel)
-        if not formation_ok:
-            tag = "no_formation"
-        elif not not_extended:
-            tag = "extended"
+        # First failing gate wins for the funnel reason tag
+        if not not_extended:
+            tag = "extended_30m"
+        elif not not_at_peak:
+            tag = "peak_5m"
         elif not di_ok:
             tag = "di_neg"
         else:
@@ -786,13 +808,12 @@ def check_symbol_trend(symbol: str) -> dict:
         result = {
             'is_long_ok':   is_long_ok,
             'adx':          round(adx_now, 2),
-            'adx_velocity': round(adx_now - adx_5bar_ago, 2),
             'di_spread':    round(di_spread, 2),
-            'breakout':     breakout,
+            'sym_5m_pump':  round(sym_5m_pump * 100, 2),
             'sym_30m_pump': round(sym_30m_pump * 100, 2),
             'reason':       (
-                f"{tag} ΔADX={adx_now-adx_5bar_ago:+.1f} brk={int(breakout)} "
-                f"30m={sym_30m_pump*100:+.2f}% DI={di_spread:+.1f}"
+                f"{tag} 5m={sym_5m_pump*100:+.2f}% 30m={sym_30m_pump*100:+.2f}% "
+                f"DI={di_spread:+.1f}"
             ),
         }
         _symbol_trend_cache[symbol] = {'data': result, 'ts': time.time()}
@@ -1008,6 +1029,14 @@ def get_btc_regime_v3_fast() -> dict:
             btc_30m_pump = float(btc_arr[-1] / btc_arr[-7] - 1)
         is_overextended = btc_30m_pump > MAX_30MIN_PUMP_PCT
 
+        # [V5-EV] Anti-peak (5min): block when BTC just spiked. Backtest:
+        #   BTC 5m > +0.3% setups → fwd 30m gross EV = -0.79%, WR = 3%.
+        # This single filter is the strongest -EV remover in the dataset.
+        btc_5m_pump = 0.0
+        if btc_arr is not None and len(btc_arr) > 1:
+            btc_5m_pump = float(btc_arr[-1] / btc_arr[-2] - 1)
+        is_at_peak = btc_5m_pump > MAX_5MIN_PUMP_PCT
+
         # Light direction confirmation: PDI > NDI (don't enter while NDI dominates)
         # Threshold relaxed from -3 to -1 (was over-restrictive, blocked 80% of valid setups)
         pdi_dominant = (mean_ndipdi < -1.0)
@@ -1035,27 +1064,30 @@ def get_btc_regime_v3_fast() -> dict:
         if bull_votes > n_assets // 2:
             is_bear = False
 
-        # [V4-MOMENTUM] NEW DECISION LOGIC — trend formation, not confirmation
+        # [V5-EV] DECISION LOGIC — "NOT at peak" + light directional bias.
+        # Backtest verdict: trend-FORMATION gates (ADX rising / breakout) were -EV
+        # because they fire AFTER MMs have already absorbed the move. We replace
+        # them with PEAK AVOIDANCE gates and let Lee-Ready (per-symbol flow) be
+        # the entry alpha.
         # Emit +2 only if:
-        #   1. Not high-vol panic (otherwise wide stops bleed)
-        #   2. Not overextended (BTC hasn't already pumped >1.5% in last 30min)
-        #   3. Trend FORMING — ADX rising OR volatility expanding
-        #   4. PDI not strongly dominated by NDI (light direction filter)
-        #   5. Not in confirmed bear (>50% majors down -3% over 7d AND macro ADX>30)
+        #   1. Not in confirmed bear (>50% majors -3%/7d & macro ADX>30) — hard veto
+        #   2. Not high-vol panic (wide stops bleed) — hard veto
+        #   3. Not overextended at 30m horizon (BTC pump < 1.5% in 30min)
+        #   4. Not spiking right now (BTC pump < 0.3% in 5min) — strongest -EV remover
+        #   5. PDI not strongly dominated by NDI (light directional bias)
         regime_signal = 0
         _block_reason = []
 
-        if is_highvol:
-            _block_reason.append(f"L1-HighVol: ATR%={mean_atr:.4f} > {atr_hi:.4f}")
+        if is_bear:
+            _block_reason.append(f"L1-Bear: bear_votes={bear_votes}/{n_assets} & ADX>{30}")
+        elif is_highvol:
+            _block_reason.append(f"L2-HighVol: ATR%={mean_atr:.4f} > {atr_hi:.4f}")
         elif is_overextended:
-            _block_reason.append(f"L2-Overextended: BTC 30m={btc_30m_pump*100:+.2f}%"
-                                 f" > {MAX_30MIN_PUMP_PCT*100:.1f}% (anti-chase)")
-        elif is_bear:
-            _block_reason.append(f"L3-Bear: bear_votes={bear_votes}/{n_assets} & ADX>{30}")
-        elif not (adx_velocity > ADX_RISING_THR or bbw_expanding):
-            _block_reason.append(
-                f"L4-NoFormation: ΔADX(25m)={adx_velocity:+.2f} (need >+{ADX_RISING_THR}) | "
-                f"BBW{'↑' if bbw_expanding else '→'}")
+            _block_reason.append(f"L3-Overextended30m: BTC 30m={btc_30m_pump*100:+.2f}%"
+                                 f" > {MAX_30MIN_PUMP_PCT*100:.1f}%")
+        elif is_at_peak:
+            _block_reason.append(f"L4-AtPeak5m: BTC 5m={btc_5m_pump*100:+.2f}%"
+                                 f" > {MAX_5MIN_PUMP_PCT*100:.2f}% (anti-peak)")
         elif not pdi_dominant:
             _block_reason.append(
                 f"L5-NDIDominant: NDI-PDI={mean_ndipdi:+.2f} (need < -1.0)")
@@ -1089,13 +1121,13 @@ def get_btc_regime_v3_fast() -> dict:
             'decision_text': status_text,
             'mean_ndi':    round(mean_ndi, 3),
             'mean_pdi':    round(mean_pdi, 3),
-            'ndi_slope':   round(adx_velocity, 3),       # [V4] CSV: was ndi_slope, now ΔADX(25m)
-            'pdi_slope':   round(btc_30m_pump * 100, 3), # [V4] CSV: was pdi_slope, now BTC 30m %
-            'ndi_rising':  int(adx_velocity > ADX_RISING_THR),
-            'pdi_rising':  int(bbw_expanding),
+            'ndi_slope':   round(adx_velocity, 3),       # CSV-compat: ΔADX(25m), info-only
+            'pdi_slope':   round(btc_30m_pump * 100, 3), # CSV-compat: BTC 30m %
+            'ndi_rising':  int(not is_at_peak),          # [V5] reused: 1 if NOT at 5m peak
+            'pdi_rising':  int(not is_overextended),     # [V5] reused: 1 if NOT 30m overextended
             'ndipdi':      round(mean_ndipdi, 3),
             'score':       round(score, 4),
-            'ema_dir':     int(pdi_dominant),  # [V4] reused: 1 if PDI dominant
+            'ema_dir':     int(pdi_dominant),
             'is_bear':     int(is_bear),
         })
 
@@ -1103,7 +1135,7 @@ def get_btc_regime_v3_fast() -> dict:
             'BTC/ETH/SOL Price', '',
             'ATR%', 'HighVol', '',
             'Trend-Health Score (info)', 'ADX (mean)', 'BBW (mean)', '',
-            'ΔADX 25m (formation)', 'BBW expanding', 'BTC 30m pump (anti-chase)', '',
+            'BTC 5m pump (anti-peak)', 'BTC 30m pump (anti-chase)', '',
             '-DI (mean)', '+DI (mean)', 'NDI-PDI', '',
             'Bear', 'bear_votes', 'bull_votes', '',
             'Signal', 'Decision',
@@ -1113,8 +1145,7 @@ def get_btc_regime_v3_fast() -> dict:
             f"{mean_atr:.4f} (highvol_thr: {atr_hi:.4f})", f"{'Y ⚠️' if is_highvol else 'N'}", '',
             f"{score:.3f}  (ADX×0.5 + DI×0.3 + BBW×0.2) [INFO ONLY]",
             f"{mean_adx:.1f}", f"{mean_bbw:.4f}", '',
-            f"{adx_velocity:+.2f}  (need > +{ADX_RISING_THR} for +2)",
-            f"{'✅ ↑' if bbw_expanding else '→'}  (alt-trigger to ΔADX)",
+            f"{btc_5m_pump*100:+.2f}%  (max {MAX_5MIN_PUMP_PCT*100:.2f}% else block)",
             f"{btc_30m_pump*100:+.2f}%  (max {MAX_30MIN_PUMP_PCT*100:.1f}% else block)", '',
             f"{mean_ndi:.2f}", f"{mean_pdi:.2f}",
             f"{mean_ndipdi:+.2f}  (need <-1.0 for +2)", '',
@@ -1128,7 +1159,7 @@ def get_btc_regime_v3_fast() -> dict:
             for lbl, val in zip(labels, values)
         ]
         utc_str  = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        hdr_line = (f"🌐 市場狀態 V3-HL（{len(regime_data)} 個資產）[{utc_str}]"
+        hdr_line = (f"🌐 市場狀態 V5-EV（{len(regime_data)} 個資產）[{utc_str}]"
                     + (" [SIM]" if SIMULATION_MODE else " [LIVE]"))
         sep_len  = max(len(hdr_line), max((len(L) for L in table_lines if L), default=0)) + 2
         sep_len  = max(sep_len, 60)
@@ -1163,10 +1194,9 @@ def get_btc_regime_v3_fast() -> dict:
             except Exception as e:
                 logger.warning(f"⚠️ Telegram市場狀態通知失敗: {e}")
 
-        # [V4-MOMENTUM] ADX MEI (Momentum Exhaustion Index) REMOVED.
-        # MEI was a band-aid for top-chasing entries: flagged "decelerating" ADX as a top.
-        # With trend-FORMATION entries (ADX rising + anti-chase + tight SL), there's no
-        # top to protect — if momentum dies, the 1.2×ATR SL handles it cheaply.
+        # [V5-EV] ADX MEI / formation gates / breakout requirements all REMOVED — see top
+        # of file. They were band-aids for a structurally -EV thesis (chase momentum on
+        # 5m majors). V5 substitutes: anti-peak (5m+30m) + Lee-Ready alpha + tight 1.0×ATR SL.
 
         result = {
             'signal':        signal,
@@ -1174,11 +1204,11 @@ def get_btc_regime_v3_fast() -> dict:
             'soft_brake':    soft_brake,
             'brake_reason':  brake_reason,
             'regime_signal': regime_signal,
-            'market_score':  score,        # trend-health 0-1 (info only, not a gate)
+            'market_score':  score,         # trend-health 0-1 (info only, not a gate)
             'mean_adx':      mean_adx,
-            'adx_velocity':  adx_velocity,  # ΔADX over 25m — primary formation signal
-            'bbw_expanding': bbw_expanding,
-            'btc_30m_pump':  btc_30m_pump,  # used by execute_live_long anti-chase guard
+            'adx_velocity':  adx_velocity,  # ΔADX over 25m — info only (was V4 gate)
+            'btc_30m_pump':  btc_30m_pump,  # 30m anti-chase guard input
+            'btc_5m_pump':   btc_5m_pump,   # 5m anti-peak guard input
             'is_highvol':    is_highvol,
             'is_bear':       is_bear,
         }
@@ -1576,17 +1606,24 @@ def manage_long_positions(regime: dict = None) -> None:
                         print(f"🔶 {s} Regime轉向→收緊SL: {pos['sl_price']:.4f} "
                               f"(Regime={rs0}, 持倉{_held_min:.1f}min)")
 
-                # ── Breakeven push (profit > 2.0 × ATR%) ──
-                if not pos['is_breakeven'] and pnl_pct > (coin_vol_pct * 2.0):
+                # ── Breakeven push (profit > 0.7 × ATR%) ──
+                # [V5-EV] Threshold reduced from 2.0×ATR (V4) to 0.7×ATR.
+                # With V5 TP=1.5×ATR, the V4 trigger at 2.0×ATR could NEVER fire
+                # (TP hits first). 0.7×ATR ≈ 47% of way to TP — far enough that
+                # it's not noise, close enough that we lock in survival vs the
+                # 1.0×ATR initial SL.
+                if not pos['is_breakeven'] and pnl_pct > (coin_vol_pct * 0.7):
                     pos['sl_price']     = pos['entry_price'] * 1.002
                     pos['is_breakeven'] = True
                     sl_updated          = True
 
-                # [V4-MOMENTUM] Single-stage trailing stop (was 5-stage with regime/decel branches).
-                # 5-stage trail had no data-driven justification; the only thing that matters
-                # for momentum trades is "give back at most 1×ATR of unrealised peak".
+                # [V5-EV] Single-stage trailing stop. After breakeven, give back at
+                # most 0.6×ATR of the running peak. Tightened from 1.0×ATR (V4)
+                # because V5 TP target is 1.5×ATR — losing 1.0×ATR of profit before
+                # trail catches up means we'd hit BE on a move that touched 1.7×ATR
+                # (no realistic improvement over taking TP).
                 if pos['is_breakeven']:
-                    trail_sl = curr_p - (1.0 * pos['atr'])
+                    trail_sl = curr_p - (0.6 * pos['atr'])
                     if trail_sl > pos['sl_price']:
                         if (trail_sl - pos['sl_price']) / pos['sl_price'] > 0.0005:
                             sl_updated      = True
@@ -1731,19 +1768,21 @@ def execute_live_long(symbol: str, net_flow: float, current_price: float,
     if not is_volatile:
         return 'low_vol'
 
-    # [V4-MOMENTUM] Regime-level anti-chase: if BTC has already pumped > MAX_30MIN_PUMP_PCT,
-    # we are too late. The regime detector already enforces this, but we re-check here
-    # because by the time Lee-Ready triggers per-symbol, BTC may have moved further.
-    _btc_pump = (regime or {}).get('btc_30m_pump', 0.0)
-    if _btc_pump > MAX_30MIN_PUMP_PCT:
-        return 'btc_pumped'
+    # [V5-EV] Re-check anti-chase / anti-peak at execute time.
+    # By the time Lee-Ready scans 30 symbols (sequential 0.3s sleep ≈ 9s), BTC could
+    # have moved out of the OK zone. Re-checking here avoids latency-induced bad fills.
+    _btc_30m = (regime or {}).get('btc_30m_pump', 0.0)
+    _btc_5m  = (regime or {}).get('btc_5m_pump',  0.0)
+    if _btc_30m > MAX_30MIN_PUMP_PCT:
+        return 'btc_pumped_30m'
+    if _btc_5m  > MAX_5MIN_PUMP_PCT:
+        return 'btc_peak_5m'
 
-    # ── [V4] Symbol-level formation gate (ADX rising + breakout + symbol not extended) ──
+    # ── [V5] Symbol-level peak-avoidance gate (anti-extended, anti-spike, +DI≥-DI) ──
     _trend = check_symbol_trend(symbol)
     if not _trend.get('is_long_ok'):
-        # Stash the reason on the dict so caller can surface it (less spammy than printing)
         return f"sym_gate:{_trend.get('reason', 'n/a')}"
-    print(f"✅ [Symbol-gate] {symbol} formation: {_trend.get('reason', 'n/a')}")
+    print(f"✅ [Symbol-gate] {symbol} {_trend.get('reason', 'n/a')}")
 
     # Tier 2 auto-scale
     if symbol in TIER2_SET:
@@ -1961,11 +2000,13 @@ def execute_live_long(symbol: str, net_flow: float, current_price: float,
 def main() -> None:
     mode_label = "🔵 SIMULATION" if SIMULATION_MODE else "🟢 LIVE TRADE"
     print("=" * 60)
-    print(f"🚀 AI 實戰 V4 Trend FORMATION Long [Hyperliquid] [{mode_label}] 啟動")
+    print(f"🚀 AI 實戰 V5-EV Anti-Peak Long [Hyperliquid] [{mode_label}] 啟動")
     print(f"   SL={SL_ATR_MULT}×ATR | TP={TP_ATR_MULT}×ATR (R:R={TP_ATR_MULT/SL_ATR_MULT:.1f}:1)")
-    print(f"   Anti-chase: 跳過若 BTC 30min > {MAX_30MIN_PUMP_PCT*100:.1f}%")
-    print(f"   入場: ΔADX(25m)>+{ADX_RISING_THR} OR BBW expanding | Lee-Ready flow + breakout")
-    print(f"   Timeout={TIMEOUT_SECONDS//60}min | Trail=1×ATR | ActiveSignals={ACTIVE_LONG_SIGNALS}")
+    print(f"   Anti-peak  5m: 跳過若 BTC 5min > {MAX_5MIN_PUMP_PCT*100:.2f}%")
+    print(f"   Anti-chase 30m: 跳過若 BTC 30min > {MAX_30MIN_PUMP_PCT*100:.1f}%")
+    print(f"   Sym anti-peak 5m: 跳過若 sym 5min > {MAX_5MIN_PUMP_SYM*100:.2f}%")
+    print(f"   入場 alpha: Lee-Ready net-flow z>{NET_FLOW_SIGMA}σ OR sniper(flow+accel+imbal>0.15)")
+    print(f"   Timeout={TIMEOUT_SECONDS//60}min | BE@+0.7×ATR | Trail=0.6×ATR | ActiveSignals={ACTIVE_LONG_SIGNALS}")
     print(f"   Fee: taker={FEE_RATE*100:.4f}% / maker={FEE_RATE_MAKER*100:.4f}%")
     print(f"   Regime緩存={REGIME_CACHE_TTL}s | ATR緩存={ATR_CACHE_TTL}s | Pos緩存={POSITIONS_CACHE_TTL}s")
     if not SIMULATION_MODE:
@@ -2034,28 +2075,22 @@ def main() -> None:
                 regime_signal  = regime.get('regime_signal', 0)
                 is_long_signal = regime_signal in ACTIVE_LONG_SIGNALS
 
-                _SIGNAL_LABEL = {0: "中性", +2: "趨勢多頭✅"}
+                _SIGNAL_LABEL = {0: "中性", +2: "Anti-Peak OK ✅"}
                 if _current_state != _last_brake_state:
                     print(f"📡 Regime: {_SIGNAL_LABEL.get(regime_signal, '未知')} | "
                           f"啟用多頭訊號: {ACTIVE_LONG_SIGNALS}")
 
                 if is_long_signal:
-                    # [V4-MOMENTUM] Position multiplier simplified:
-                    #   - Sensor B (consecutive-regime ramp 0.25→1.0)  REMOVED
-                    #     Reason: scaled UP after trend ran for 12 cycles = late-entry magnifier.
-                    #   - MEI top protection gate (block when adx_mei < -2)  REMOVED
-                    #     Reason: was a band-aid for top-chasing entries; with formation entries
-                    #     + tight 1.2×ATR SL, "top protection" is structurally unnecessary.
-                    #   - SOFT-DAILY (× 0.5 when 1D not bullish)  REMOVED
-                    #     Reason: 1D consensus has ~0 correlation with fwd 30m return on majors.
-                    #   - Cascade SL freeze  REMOVED
-                    #     Reason: cascade SL was caused by top-chasing entries; new trend-formation
-                    #     entries with 1.2×ATR SL have decorrelated SL events.
+                    # [V5-EV] Position multiplier kept at 1.0 (aggressive baseline).
+                    # All previous conditional sizing logic (Sensor B / MEI / SOFT-DAILY /
+                    # Cascade-SL freeze) was V3/V4 protection against -EV chase entries;
+                    # V5 fixes the EV problem upstream (anti-peak gates) so those become
+                    # redundant.
                     position_multiplier = 1.0
-                    mean_adx        = regime.get('mean_adx', 0)
-                    adx_velocity    = regime.get('adx_velocity', 0)
-                    btc_30m_pump    = regime.get('btc_30m_pump', 0)
-                    print(f"🟢 [V4] 趨勢多頭 ADX={mean_adx:.1f} ΔADX25m={adx_velocity:+.2f}"
+                    mean_adx     = regime.get('mean_adx', 0)
+                    btc_5m_pump  = regime.get('btc_5m_pump',  0)
+                    btc_30m_pump = regime.get('btc_30m_pump', 0)
+                    print(f"🟢 [V5] OK ADX={mean_adx:.1f} BTC5m={btc_5m_pump*100:+.2f}%"
                           f" BTC30m={btc_30m_pump*100:+.2f}%"
                           f" {'[SIM]' if SIMULATION_MODE else ''}")
 
