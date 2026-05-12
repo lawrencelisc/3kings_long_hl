@@ -223,9 +223,11 @@ if SIMULATION_MODE:
 # ==========================================
 # ⚙️ In-Memory State
 # ==========================================
-positions:          dict  = {}
-cooldown_tracker:   dict  = {}
-consecutive_losses: dict  = {}
+positions:            dict  = {}
+cooldown_tracker:     dict  = {}
+consecutive_losses:   dict  = {}
+# [A4] Pending maker (postOnly) orders awaiting fill; adopted in _adopt_filled_maker_orders().
+pending_maker_orders: dict  = {}
 
 # [V4-MOMENTUM] Removed:
 #   _adx_history          (fed MEI top-protection gate — gate removed)
@@ -266,16 +268,16 @@ NET_FLOW_SIGMA = float(os.getenv('NET_FLOW_SIGMA', '1.0'))
 TP_ATR_MULT    = float(os.getenv('TP_ATR_MULT', '1.5'))
 SL_ATR_MULT    = float(os.getenv('SL_ATR_MULT', '1.0'))
 
-# [V5-EV] Anti-chase (medium horizon): block when BTC already pumped > 1.5% in 30min.
-MAX_30MIN_PUMP_PCT = float(os.getenv('MAX_30MIN_PUMP_PCT', '0.015'))   # 1.5%
+# [A2] Anti-chase (medium horizon): raised 1.5% → 2.5%.
+# WFA on 3,573 regime rows: BTC 30m ∈ (0%, +1.5%] WR=60.9%; (1.0%, 1.5%] WR=58.5%.
+# The -EV zone only starts reliably at >3%. 2.5% gives back all the positive-WR region.
+MAX_30MIN_PUMP_PCT = float(os.getenv('MAX_30MIN_PUMP_PCT', '0.025'))   # 2.5%
 
-# [V5-EV] Anti-peak (short horizon): block when BTC just spiked > 0.3% in last 5min.
-# Backtest evidence: entries in this state have fwd 30m gross EV = -0.79%, WR = 3%.
-MAX_5MIN_PUMP_PCT  = float(os.getenv('MAX_5MIN_PUMP_PCT', '0.003'))    # 0.3%
-
-# [V5-EV] Symbol-level anti-peak: alt 5m pump cap (looser than BTC because alts have
-# higher beta but mean-revert faster).
-MAX_5MIN_PUMP_SYM  = float(os.getenv('MAX_5MIN_PUMP_SYM', '0.008'))    # 0.8%
+# [A1] MAX_5MIN_PUMP_PCT / MAX_5MIN_PUMP_SYM: kept for .env compat and log monitoring.
+# Anti-peak 5m gate REMOVED — 3,573-row WFA: PASS vs BLOCK fwd-30m WR = 54.5% vs 54.5%
+# (identical). Zero predictive power. These constants are NOT used as entry gates anymore.
+MAX_5MIN_PUMP_PCT  = float(os.getenv('MAX_5MIN_PUMP_PCT', '0.003'))    # 0.3% [monitor only]
+MAX_5MIN_PUMP_SYM  = float(os.getenv('MAX_5MIN_PUMP_SYM', '0.008'))    # 0.8% [monitor only]
 
 # [V5-EV] ADX_RISING_THR retained for backwards-compat in CSV/log columns; NOT a gate.
 ADX_RISING_THR = float(os.getenv('ADX_RISING_THR', '0.0'))
@@ -292,6 +294,11 @@ MAX_CONCURRENT_POSITIONS = 5
 SCOUTING_INTERVAL = 125
 # [HL-10] Reduced from 4s: HL sub-100ms latency allows tighter monitoring
 POSITION_CHECK_INTERVAL = 2
+
+# [A4] Maker order timeout: cancel pending postOnly orders after this many seconds.
+# Lee-Ready signal decays fast; if price hasn't returned to our bid within 60s the
+# setup is stale and we'd be holding a limit for a signal that no longer exists.
+MAKER_ORDER_TIMEOUT = 60
 
 # [V4-MOMENTUM] Tightened from 90min → 30min. Momentum trades that don't work in
 # 30min are unlikely to recover; holding longer just bleeds opportunity cost.
@@ -398,6 +405,8 @@ STATUS_COLUMNS = [
     'adx', 'signal_code', 'decision_text',
     'mean_ndi', 'mean_pdi', 'ndi_slope', 'pdi_slope',
     'ndi_rising', 'pdi_rising', 'ndipdi',
+    # ema_dir: [V5.1] legacy column — 1 if old L5 (NDI-PDI<-1) would have passed; 0 otherwise.
+    #           NOT a gate anymore (WFA: DI has no predictive power); monitors DI vs CSV history only.
     'score', 'ema_dir', 'is_bear',
 ]
 
@@ -430,10 +439,14 @@ def log_status_to_csv(data_dict: dict) -> None:
 # ==========================================
 # 🔵 [MODULE 2] Simulation Ledger (Long-Only)
 # ==========================================
-def sim_open_long(symbol: str, amount: float, price: float) -> tuple:
-    """Simulate long entry: deduct cost + taker fee from sim_balance."""
+def sim_open_long(symbol: str, amount: float, price: float,
+                  fee_rate: float = None) -> tuple:
+    """Simulate long entry: deduct cost + fee from sim_balance.
+    fee_rate defaults to FEE_RATE (taker); pass FEE_RATE_MAKER for maker-entry simulation."""
     global sim_balance, sim_trade_count
-    fee  = amount * price * FEE_RATE
+    if fee_rate is None:
+        fee_rate = FEE_RATE
+    fee  = amount * price * fee_rate
     cost = amount * price + fee
     if sim_balance < cost:
         logger.warning(f"🔵 [SIM] {symbol} 餘額不足 (需 {cost:.2f}, 有 {sim_balance:.2f})")
@@ -738,8 +751,8 @@ def check_symbol_trend(symbol: str) -> dict:
         directional predictive power (UP correct ≤50%, p<0.05 rate ≤4%) → removed
 
     What remains:
-      • not_extended_30m  (symbol's own 30m pump < 2.25%) — anti-chase per-symbol
-      • not_at_peak_5m    (symbol's own 5m pump < 0.8%)   — anti-peak per-symbol
+      • not_extended_30m  (symbol's own 30m pump < 3.75%) — anti-chase per-symbol [A2: ×1.5 of 2.5%]
+      • [A1-REMOVED] not_at_peak_5m — WFA: zero predictive power; still logged for monitoring
 
     What does the heavy lifting: Lee-Ready net flow z-score / sniper signal.
     DI spread is still computed and logged for monitoring; NOT a gate.
@@ -782,26 +795,21 @@ def check_symbol_trend(symbol: str) -> dict:
 
         adx_now = float(adx_arr[-1])
 
-        # Anti-chase 30min: each bar=5min × 6 bars = 30min
-        sym_30m_pump = float(closes[-1] / closes[-7] - 1) if len(closes) > 7 else 0.0
+        # [A5] Anti-chase 30min: use fully-closed bars to avoid partial-bar distortion.
+        # closes[-2]/closes[-8] = 6 fully-closed 5m bars = 30min.
+        sym_30m_pump = float(closes[-2] / closes[-8] - 1) if len(closes) > 8 else 0.0
         not_extended = sym_30m_pump < (MAX_30MIN_PUMP_PCT * 1.5)   # symbol looser (×1.5)
 
-        # Anti-peak 5min: this is the strongest -EV remover on majors microstructure
-        sym_5m_pump  = float(closes[-1] / closes[-2] - 1) if len(closes) > 2 else 0.0
-        not_at_peak  = sym_5m_pump < MAX_5MIN_PUMP_SYM           # default 0.8% on alts
+        # [A1] Anti-peak 5m gate REMOVED (zero predictive power in WFA).
+        # Still computed with closed bars for log monitoring only.
+        sym_5m_pump  = float(closes[-2] / closes[-3] - 1) if len(closes) > 3 else 0.0
 
-        # DI spread: computed for monitoring/logging only — NOT a gate (WFA: zero predictive power)
+        # DI spread: monitoring/logging only — NOT a gate (WFA: zero predictive power)
         di_spread   = float(pdi[-1]) - float(ndi[-1])
 
-        is_long_ok  = not_extended and not_at_peak
-
-        # First failing gate wins for the funnel reason tag
-        if not not_extended:
-            tag = "extended_30m"
-        elif not not_at_peak:
-            tag = "peak_5m"
-        else:
-            tag = "ok"
+        # Only anti-chase 30m remains as the gate
+        is_long_ok  = not_extended
+        tag = "extended_30m" if not not_extended else "ok"
 
         result = {
             'is_long_ok':   is_long_ok,
@@ -810,7 +818,7 @@ def check_symbol_trend(symbol: str) -> dict:
             'sym_5m_pump':  round(sym_5m_pump * 100, 2),
             'sym_30m_pump': round(sym_30m_pump * 100, 2),
             'reason':       (
-                f"{tag} 5m={sym_5m_pump*100:+.2f}% 30m={sym_30m_pump*100:+.2f}% "
+                f"{tag} 5m={sym_5m_pump*100:+.2f}%[info] 30m={sym_30m_pump*100:+.2f}% "
                 f"DI={di_spread:+.1f}[info]"
             ),
         }
@@ -1021,29 +1029,26 @@ def get_btc_regime_v3_fast() -> dict:
         adx_velocity  = mean_adx - adx_5bar_avg              # +ve = trend forming
         bbw_expanding = (mean_bbw > bbw_5bar_avg * 1.05)     # vol breakout: +5%
 
-        # Anti-chase: BTC 30min pump (each bar 5min × 6 bars = 30min)
+        # [A5] Anti-chase: BTC 30min pump using fully-closed bars.
+        # closes[-2]/closes[-8] = 6 fully-closed 5m bars = 30min (avoids partial-bar noise).
         btc_arr = regime_data.get('BTC/USDC:USDC', {}).get('closes', None)
-        if btc_arr is not None and len(btc_arr) > 6:
-            btc_30m_pump = float(btc_arr[-1] / btc_arr[-7] - 1)
+        if btc_arr is not None and len(btc_arr) > 8:
+            btc_30m_pump = float(btc_arr[-2] / btc_arr[-8] - 1)
         is_overextended = btc_30m_pump > MAX_30MIN_PUMP_PCT
 
-        # [V5-EV] Anti-peak (5min): block when BTC just spiked. Backtest:
-        #   BTC 5m > +0.3% setups → fwd 30m gross EV = -0.79%, WR = 3%.
-        # This single filter is the strongest -EV remover in the dataset.
+        # [A5] BTC last fully-closed 5m bar — monitoring only; no longer a hard gate.
+        # [A1] Anti-peak 5m gate REMOVED: 3,573-row WFA showed identical fwd-30m WR
+        #      (54.5%) for pass vs block rows — zero predictive power.
         btc_5m_pump = 0.0
-        if btc_arr is not None and len(btc_arr) > 1:
-            btc_5m_pump = float(btc_arr[-1] / btc_arr[-2] - 1)
-        is_at_peak = btc_5m_pump > MAX_5MIN_PUMP_PCT
+        if btc_arr is not None and len(btc_arr) > 2:
+            btc_5m_pump = float(btc_arr[-2] / btc_arr[-3] - 1)
+        is_at_peak = False   # kept as False so table rendering still works; never blocks
 
-        # [V5.1-REMOVED] pdi_dominant / L5-NDIDominant gate REMOVED.
-        # WFA research (Binance 1H+4H, BTC/ETH/SOL, 2022–2026) showed +DI/-DI has
-        # zero directional predictive power at these timeframes:
-        #   UP regime avg next return = negative (should be positive)
-        #   DOWN regime avg next return = positive (should be negative)
-        #   p<0.05 hit rate across all 3 experiment versions: ≤ 4% (threshold: ≥ 60%)
-        # The gate was blocking entries without any EV justification.
-        # NDI-PDI is still computed and logged for monitoring; it is NOT a gate.
-        pdi_dominant = True   # always pass — kept as variable to avoid log/CSV refactor
+        # [V5.1-REMOVED] L5 (PDI dominant / NDI-PDI < -1.0) gate REMOVED — see WFA memo above header.
+        # Log OLD gate outcome into CSV `ema_dir` so spreadsheets remain interpretable:
+        #   1 = legacy L5 would PASS (mean NDIPDI < -1, i.e. +DI clearly dominant cross-asset)
+        #   0 = legacy L5 would BLOCK — regime may still be +2 because DI no longer gates.
+        legacy_l5_would_pass = int(mean_ndipdi < -1.0)
 
         # Composite score kept for monitoring/logging only — NOT used as an entry gate
         def _norm(val, lo, hi):
@@ -1068,14 +1073,14 @@ def get_btc_regime_v3_fast() -> dict:
         if bull_votes > n_assets // 2:
             is_bear = False
 
-        # [V5.1-EV] DECISION LOGIC — 4 hard vetos only, no DI direction gate.
+        # [V6-EV] DECISION LOGIC — 3 hard vetos (L4 anti-peak removed after WFA).
         # Gates (evidence-backed):
         #   L1. Confirmed macro bear (>50% majors 7d < -3% & ADX>30)
         #   L2. High-vol panic (ATR% at 90th pct — wide stops bleed capital)
-        #   L3. BTC overextended 30m (pump > 1.5%) — anti-chase
-        #   L4. BTC at immediate peak 5m (pump > 0.3%) — strongest single -EV remover
+        #   L3. BTC overextended 30m (pump > 2.5%) — anti-chase [A2: raised from 1.5%]
         # Removed:
-        #   L5. PDI dominant (NDI-PDI < -1.0) — WFA shows zero predictive power
+        #   L4. BTC at 5m peak — [A1] WFA: pass vs block WR = 54.5% vs 54.5% (zero signal)
+        #   L5. PDI dominant — WFA shows zero predictive power
         regime_signal = 0
         _block_reason = []
 
@@ -1086,9 +1091,6 @@ def get_btc_regime_v3_fast() -> dict:
         elif is_overextended:
             _block_reason.append(f"L3-Overextended30m: BTC 30m={btc_30m_pump*100:+.2f}%"
                                  f" > {MAX_30MIN_PUMP_PCT*100:.1f}%")
-        elif is_at_peak:
-            _block_reason.append(f"L4-AtPeak5m: BTC 5m={btc_5m_pump*100:+.2f}%"
-                                 f" > {MAX_5MIN_PUMP_PCT*100:.2f}% (anti-peak)")
         else:
             regime_signal = +2
 
@@ -1107,8 +1109,10 @@ def get_btc_regime_v3_fast() -> dict:
         eth_p = regime_data.get('ETH/USDC:USDC', {}).get('closes', [0])[-1]
         sol_p = regime_data.get('SOL/USDC:USDC', {}).get('closes', [0])[-1]
 
-        signal_names = {0: "無信號", +2: "趨勢多頭"}
-        status_text  = f"📊 市場狀態: {signal_names.get(regime_signal, '未知')}"
+        signal_names = {0: "無信號", +2: "Anti-Chase OK"}
+        status_text  = f"📊 市場狀態: {signal_names.get(regime_signal, '未知')}｜可掃描做多"
+        if regime_signal == +2 and not legacy_l5_would_pass:
+            status_text += "｜DI僅監控(舊L5會阻)"
         if is_highvol: status_text += " ⚠️ 高波動期"
         if is_bear:    status_text += " 🐻 巨集觀熊市"
 
@@ -1121,11 +1125,11 @@ def get_btc_regime_v3_fast() -> dict:
             'mean_pdi':    round(mean_pdi, 3),
             'ndi_slope':   round(adx_velocity, 3),       # CSV-compat: ΔADX(25m), info-only
             'pdi_slope':   round(btc_30m_pump * 100, 3), # CSV-compat: BTC 30m %
-            'ndi_rising':  int(not is_at_peak),          # [V5] reused: 1 if NOT at 5m peak
+            'ndi_rising':  int(btc_5m_pump >= 0),         # [V6] reused: 1 if last closed bar positive (info)
             'pdi_rising':  int(not is_overextended),     # [V5] reused: 1 if NOT 30m overextended
             'ndipdi':      round(mean_ndipdi, 3),
             'score':       round(score, 4),
-            'ema_dir':     int(pdi_dominant),
+            'ema_dir':     legacy_l5_would_pass,
             'is_bear':     int(is_bear),
         })
 
@@ -1143,7 +1147,7 @@ def get_btc_regime_v3_fast() -> dict:
             f"{mean_atr:.4f} (highvol_thr: {atr_hi:.4f})", f"{'Y ⚠️' if is_highvol else 'N'}", '',
             f"{score:.3f}  (ADX×0.5 + DI×0.3 + BBW×0.2) [INFO ONLY]",
             f"{mean_adx:.1f}", f"{mean_bbw:.4f}", '',
-            f"{btc_5m_pump*100:+.2f}%  (max {MAX_5MIN_PUMP_PCT*100:.2f}% else block)",
+            f"{btc_5m_pump*100:+.2f}%  [監控: {MAX_5MIN_PUMP_PCT*100:.2f}%，gate已移除]",
             f"{btc_30m_pump*100:+.2f}%  (max {MAX_30MIN_PUMP_PCT*100:.1f}% else block)", '',
             f"{mean_ndi:.2f}", f"{mean_pdi:.2f}",
             f"{mean_ndipdi:+.2f}  [info only — WFA: no predictive power]", '',
@@ -1472,6 +1476,116 @@ def sync_positions_on_startup() -> None:
 
 
 # ==========================================
+# 🛡️ [MODULE 11b] Maker Order Adoption (A4)
+# ==========================================
+def _adopt_filled_maker_orders() -> None:
+    """
+    Check all pending postOnly maker orders and adopt any that have filled.
+    Cancel orders that exceed MAKER_ORDER_TIMEOUT seconds.
+    Called at the top of each manage_long_positions() cycle — non-blocking.
+    """
+    if SIMULATION_MODE or not pending_maker_orders:
+        return
+    _now = time.time()
+    for s in list(pending_maker_orders.keys()):
+        pmo = pending_maker_orders[s]
+
+        # ── Timeout: cancel if order is too old ──
+        if _now - pmo['ts'] > MAKER_ORDER_TIMEOUT:
+            cancel_all_hl(s)
+            del pending_maker_orders[s]
+            logger.info(f"⏱️ {s} Maker掛單逾時 {MAKER_ORDER_TIMEOUT}s，已撤銷")
+            continue
+
+        # ── Guard: already in positions (edge case) ──
+        if s in positions:
+            del pending_maker_orders[s]
+            continue
+
+        # ── Check fill status ──
+        try:
+            od     = exchange.fetch_order(pmo['order_id'], s, params={"acknowledged": True})
+            filled = float(od.get('filled', 0) or 0)
+            if filled <= 0:
+                continue   # still resting on book
+
+            actual_price = float(od.get('average') or od.get('price') or pmo['maker_price'])
+            atr          = pmo['atr']
+            tp_p = float(exchange.price_to_precision(s, actual_price + TP_ATR_MULT * atr))
+            sl_p = float(exchange.price_to_precision(s, actual_price - SL_ATR_MULT * atr))
+
+            # [A3] TP viability check at fill time (ATR may have changed since submission)
+            if (tp_p - actual_price) < 2 * FEE_RATE * actual_price:
+                logger.warning(f"⚠️ {s} Maker成交但利潤空間不足，市場平倉")
+                try:
+                    exchange.create_market_sell_order(s, filled, {'reduceOnly': True})
+                except Exception as e2:
+                    logger.error(f"❌ {s} Maker成交後緊急平倉失敗: {e2}")
+                del pending_maker_orders[s]
+                _positions_cache['ts'] = 0
+                continue
+
+            # ── Adopt position ──
+            positions[s] = {
+                'amount':              filled,
+                'entry_price':         actual_price,
+                'tp_price':            tp_p,
+                'sl_price':            sl_p,
+                'is_breakeven':        False,
+                'atr':                 atr,
+                'max_pnl_pct':         0.0,
+                'entry_time':          pmo['ts'],
+                'side':                'long',
+                'entry_regime_signal': pmo.get('regime_signal', 0),
+                'entry_fee_rate':      FEE_RATE_MAKER,
+            }
+            _positions_cache['ts'] = 0
+            del pending_maker_orders[s]
+
+            print(f"✅ [Maker成交] {s} @ {actual_price:.4f} USDC | "
+                  f"數量:{filled} | TP:{tp_p:.4f} | SL:{sl_p:.4f}")
+
+            log_to_csv({
+                'symbol':            s,
+                'action':            'LONG_ENTRY',
+                'price':             actual_price,
+                'amount':            filled,
+                'trade_value':       round(filled * actual_price, 2),
+                'atr':               round(atr, 4),
+                'net_flow':          round(pmo.get('net_flow', 0), 2),
+                'tp_price':          tp_p,
+                'sl_price':          sl_p,
+                'actual_balance':    round(pmo.get('actual_bal', 0), 2),
+                'effective_balance': pmo.get('eff_bal', 0),
+                'regime_signal':     pmo.get('regime_signal', 0),
+                'mean_adx':          pmo.get('adx_tag', 0),
+                'market_score':      pmo.get('score_tag', 0),
+            })
+            _safe_influx(_influx_write_trade,
+                         symbol=s, action='LONG_ENTRY',
+                         price=actual_price, amount=filled,
+                         atr=atr, net_flow=pmo.get('net_flow', 0),
+                         tp_price=tp_p, sl_price=sl_p,
+                         regime_signal=pmo.get('regime_signal', 0),
+                         mean_adx=pmo.get('adx_tag', 0),
+                         market_score=pmo.get('score_tag', 0),
+                         sim_mode=False)
+            if TELEGRAM_ENABLED and ENABLE_TELEGRAM_SEND:
+                try:
+                    telegram_notifier.send_trade_alert(
+                        symbol=s, action='LONG_ENTRY',
+                        price=actual_price, amount=filled,
+                        reason=(f"Maker Fill | ADX:{pmo.get('adx_tag', 0)} | "
+                                f"Score:{pmo.get('score_tag', 0)}")
+                    )
+                except Exception as te:
+                    logger.warning(f"⚠️ Telegram通知失敗: {te}")
+
+        except Exception as e:
+            logger.debug(f"⚠️ {s} pending maker查詢失敗: {str(e)[:80]}")
+
+
+# ==========================================
 # 🛡️ [MODULE 12] Position Manager (Long-Only, HL)
 # ==========================================
 def manage_long_positions(regime: dict = None) -> None:
@@ -1485,6 +1599,9 @@ def manage_long_positions(regime: dict = None) -> None:
     [HL-23] Short-specific code removed (long-only bot).
     """
     try:
+        # ── Step 0: Adopt filled maker orders (non-blocking; runs every cycle) ──
+        _adopt_filled_maker_orders()
+
         live_positions_raw = get_live_positions_cached()
         live_symbols = {
             p['symbol']: p for p in live_positions_raw
@@ -1683,7 +1800,7 @@ def manage_long_positions(regime: dict = None) -> None:
                                                   {'timeInForce': 'IOC', 'reduceOnly': True})
                         except Exception:
                             exchange.create_market_sell_order(s, pos['amount'], {'reduceOnly': True})
-                        entry_fee = pos['entry_price'] * pos['amount'] * FEE_RATE
+                        entry_fee = pos['entry_price'] * pos['amount'] * pos.get('entry_fee_rate', FEE_RATE)
                         exit_fee  = ioc_price * pos['amount'] * FEE_RATE
                         ioc_pnl   = round(
                             (ioc_price - pos['entry_price']) * pos['amount'] - entry_fee - exit_fee, 4
@@ -1766,15 +1883,11 @@ def execute_live_long(symbol: str, net_flow: float, current_price: float,
     if not is_volatile:
         return 'low_vol'
 
-    # [V5-EV] Re-check anti-chase / anti-peak at execute time.
-    # By the time Lee-Ready scans 30 symbols (sequential 0.3s sleep ≈ 9s), BTC could
-    # have moved out of the OK zone. Re-checking here avoids latency-induced bad fills.
+    # Anti-chase re-check at execute time (value from cached regime, ≤60s stale).
     _btc_30m = (regime or {}).get('btc_30m_pump', 0.0)
-    _btc_5m  = (regime or {}).get('btc_5m_pump',  0.0)
     if _btc_30m > MAX_30MIN_PUMP_PCT:
         return 'btc_pumped_30m'
-    if _btc_5m  > MAX_5MIN_PUMP_PCT:
-        return 'btc_peak_5m'
+    # [A1] Anti-peak 5m re-check removed — gate had zero predictive power in 3,573-row WFA.
 
     # ── [V5] Symbol-level peak-avoidance gate (anti-extended, anti-spike, +DI≥-DI) ──
     _trend = check_symbol_trend(symbol)
@@ -1822,11 +1935,10 @@ def execute_live_long(symbol: str, net_flow: float, current_price: float,
         except Exception as e:
             logger.warning(f"⚠️ [DUPCHECK] {symbol} 查詢失敗，繼續執行: {e}")
 
-    # Hard position cap
-    if len(positions) >= MAX_CONCURRENT_POSITIONS:
+    # Hard position cap (include pending maker orders to prevent over-allocation)
+    if len(positions) + len(pending_maker_orders) >= MAX_CONCURRENT_POSITIONS:
         return 'pos_cap'
 
-    # [V4-MOMENTUM] Cascade SL protection REMOVED — see strategy parameters block.
     cancel_all_hl(symbol)
     actual_bal = get_live_usdc_balance()
     eff_bal    = min(WORKING_CAPITAL, actual_bal)
@@ -1841,8 +1953,10 @@ def execute_live_long(symbol: str, net_flow: float, current_price: float,
     if amount < exchange.markets[symbol]['limits']['amount'].get('min', 0):
         return 'below_min_amt'
 
-    ioc_p = get_3_layer_avg_price(symbol, 'asks') or current_price
-    if amount * ioc_p < MIN_NOTIONAL:
+    # [A4] Maker entry: post at bid price.
+    # Fee saving: FEE_RATE_MAKER 0.013% vs taker 0.039% → RT cost 0.052% vs 0.180% (3.5×).
+    maker_p = get_3_layer_avg_price(symbol, 'bids') or current_price
+    if amount * maker_p < MIN_NOTIONAL:
         return 'below_min_notional'
 
     # [HL-9] Leverage — generalized error handling (no Bybit-specific codes)
@@ -1850,104 +1964,86 @@ def execute_live_long(symbol: str, net_flow: float, current_price: float,
         try:
             exchange.set_leverage(int(MAX_LEVERAGE), symbol)
         except Exception as e:
-            # [HL-16] Removed Bybit "110043"/"110026" guards
             logger.warning(f"⚠️ {symbol} 槓桿設置異常 (繼續嘗試入場): {e}")
 
     # ── Execute order ──
     if SIMULATION_MODE:
-        actual_amount, actual_price = sim_open_long(symbol, amount, ioc_p)
+        # Sim: immediate fill at bid with maker fee rate (simulates maker economics)
+        actual_amount, actual_price = sim_open_long(symbol, amount, maker_p,
+                                                    fee_rate=FEE_RATE_MAKER)
         if actual_amount == 0:
             print(f"⏩ [SIM] {symbol} 餘額不足，跳過。")
             return 'insufficient_bal'
     else:
+        # [A4] Live: submit postOnly limit at bid.
+        # Position is adopted asynchronously in _adopt_filled_maker_orders() inside
+        # manage_long_positions() — no blocking wait here, SL loop stays responsive.
         try:
-            # [HL-15] Removed positionIdx (Bybit hedge-mode specific)
-            order = exchange.create_order(symbol, 'limit', 'buy', amount, ioc_p,
-                                          {'timeInForce': 'IOC'})
-            time.sleep(1)
-            actual_price, actual_amount = ioc_p, 0.0
-
-            try:
-                od = exchange.fetch_order(order['id'], symbol, params={"acknowledged": True})
-                actual_price  = float(od.get('average') or od.get('price') or ioc_p)
-                actual_amount = float(od.get('filled', 0))
-            except Exception as e:
-                logger.warning(f"⚠️ {symbol} 訂單確認失敗，備用持倉同步: {e}")
-                time.sleep(0.5)
-                # Fallback: scan live positions (no category param for HL)
-                for p in exchange.fetch_positions():
-                    if (p['symbol'] == symbol and
-                            float(p.get('contracts', 0) or
-                                  p.get('info', {}).get('szi', 0) or 0) > 0):
-                        actual_amount = float(p.get('contracts', 0) or
-                                              p.get('info', {}).get('szi', 0) or 0)
-                        actual_price  = float(p.get('entryPrice') or
-                                              p.get('info', {}).get('entryPx', ioc_p) or ioc_p)
-                        break
-
-            if actual_amount == 0:
-                print(f"⏩ {symbol} IOC 未成交，撤單退出。")
-                cancel_all_hl(symbol)
-                return 'ioc_unfilled'
-
+            order = exchange.create_order(symbol, 'limit', 'buy', amount, maker_p,
+                                          {'postOnly': True})
+            pending_maker_orders[symbol] = {
+                'order_id':      order['id'],
+                'amount':        amount,
+                'maker_price':   maker_p,
+                'ts':            time.time(),
+                'atr':           atr,
+                'net_flow':      net_flow,
+                'actual_bal':    actual_bal,
+                'eff_bal':       eff_bal,
+                'regime_signal': regime_signal_tag,
+                'adx_tag':       adx_tag,
+                'score_tag':     score_tag,
+            }
+            print(f"📋 {symbol} Maker掛單 @ {maker_p:.4f} USDC | 數量:{amount} | "
+                  f"逾時:{MAKER_ORDER_TIMEOUT}s 自動撤銷")
+            cooldown_tracker[symbol] = time.time() + 480
+            save_dynamic_blacklist()
+            return 'MAKER_PENDING'
         except ccxt.RateLimitExceeded:
-            # [HL-14] Generic rate-limit handler
             logger.warning(f"⏳ {symbol} 入場遭遇 Rate Limit，等待後重試")
             time.sleep(5)
             return 'rate_limit'
         except Exception as e:
-            logger.error(f"❌ {symbol} 做多執行失敗: {e}")
+            logger.error(f"❌ {symbol} Maker掛單失敗: {e}")
             return 'exec_fail'
 
-    # ── Calculate TP/SL ──
+    # ── Calculate TP/SL (Sim path only; live returns MAKER_PENDING above) ──
     tp_p = float(exchange.price_to_precision(symbol, actual_price + TP_ATR_MULT * atr))
     sl_p = float(exchange.price_to_precision(symbol, actual_price - SL_ATR_MULT * atr))
 
-    if (tp_p - actual_price) / actual_price < 0.003:
-        print(f"🟡 放棄做多 [{symbol}]: 利潤空間太細！"
-              + (" [SIM 退還本金]" if SIMULATION_MODE else ""))
-        if SIMULATION_MODE:
-            global sim_balance
-            refund = actual_amount * actual_price
-            sim_balance += refund
-            logger.info(f"🔵 [SIM] {symbol} 退還本金 {refund:.4f}（利潤空間太細）")
-        else:
-            try:
-                exchange.create_market_sell_order(symbol, actual_amount, {'reduceOnly': True})
-            except Exception as e:
-                logger.error(f"❌ {symbol} 緊急平倉失敗: {e}")
-            cancel_all_hl(symbol)
+    # [A3] TP viability: gross profit must exceed 2× one-way fee (maker entry + taker exit).
+    # Old guard was 0.3% absolute — blocked ~80% of valid low-ATR setups.
+    # New guard: TP > 2 × FEE_RATE × price ≈ 0.078% gross (covers RT round-trip cost).
+    if (tp_p - actual_price) < 2 * FEE_RATE * actual_price:
+        print(f"🟡 [SIM] 放棄做多 [{symbol}]: TP利潤不足2×費率，退還本金")
+        global sim_balance
+        sim_balance += actual_amount * actual_price
         return 'tp_too_small'
 
-    # [HL-7] No exchange-native TP/SL call here.
-    #         Bybit used: private_post_v5_position_trading_stop(...)
-    #         HL: TP/SL enforced entirely via local logic in manage_long_positions().
-    if SIMULATION_MODE:
-        print(f"🔵 [SIM] {symbol} 虛擬 TP:{tp_p} | SL:{sl_p}")
-        sim_positions[symbol] = {
-            'amount':      actual_amount,
-            'entry_price': actual_price,
-            'tp_price':    tp_p,
-            'sl_price':    sl_p,
-            'entry_time':  time.time(),
-            'side':        'long',
-        }
-    else:
-        print(f"✅ {symbol} 本地止盈止損已記錄 | TP:{tp_p:.4f} | SL:{sl_p:.4f}")
-        _positions_cache['ts'] = 0  # invalidate cache
-
-    # ── Update local position dict ──
-    positions[symbol] = {
+    # [HL-7] TP/SL enforced entirely via local logic in manage_long_positions().
+    print(f"🔵 [SIM] {symbol} 虛擬 TP:{tp_p:.4f} | SL:{sl_p:.4f}")
+    sim_positions[symbol] = {
         'amount':      actual_amount,
         'entry_price': actual_price,
         'tp_price':    tp_p,
         'sl_price':    sl_p,
-        'is_breakeven':          False,
-        'atr':                   atr,
-        'max_pnl_pct':           0.0,
-        'entry_time':            time.time(),
-        'side':                  'long',
-        'entry_regime_signal':   regime_signal_tag,
+        'entry_time':  time.time(),
+        'side':        'long',
+    }
+
+    # ── Update local position dict ──
+    positions[symbol] = {
+        'amount':              actual_amount,
+        'entry_price':         actual_price,
+        'tp_price':            tp_p,
+        'sl_price':            sl_p,
+        'is_breakeven':        False,
+        'atr':                 atr,
+        'max_pnl_pct':         0.0,
+        'entry_time':          time.time(),
+        'side':                'long',
+        'entry_regime_signal': regime_signal_tag,
+        'entry_fee_rate':      FEE_RATE_MAKER,
     }
     cooldown_tracker[symbol] = time.time() + 480
     save_dynamic_blacklist()
@@ -1975,16 +2071,14 @@ def execute_live_long(symbol: str, net_flow: float, current_price: float,
                  tp_price=tp_p, sl_price=sl_p,
                  regime_signal=regime_signal_tag, mean_adx=adx_tag,
                  market_score=score_tag, sim_mode=SIMULATION_MODE)
-    # [HL-2] Log USDC denomination
-    print(f"📈 {'[SIM] ' if SIMULATION_MODE else ''}[入貨做多] {symbol} "
-          f"@ {actual_price:.4f} USDC | 數量:{actual_amount}")
+    print(f"📈 [SIM] [Maker入場] {symbol} @ {actual_price:.4f} USDC | 數量:{actual_amount}")
 
     if TELEGRAM_ENABLED and ENABLE_TELEGRAM_SEND:
         try:
             telegram_notifier.send_trade_alert(
                 symbol=symbol, action='LONG_ENTRY',
                 price=actual_price, amount=actual_amount,
-                reason=f"趨勢多頭 | ADX:{adx_tag} | Score:{score_tag}"
+                reason=f"Maker Entry [SIM] | ADX:{adx_tag} | Score:{score_tag}"
             )
         except Exception as e:
             logger.warning(f"⚠️ Telegram通知發送失敗: {e}")
@@ -2000,12 +2094,12 @@ def main() -> None:
     print("=" * 60)
     print(f"🚀 AI 實戰 V5-EV Anti-Peak Long [Hyperliquid] [{mode_label}] 啟動")
     print(f"   SL={SL_ATR_MULT}×ATR | TP={TP_ATR_MULT}×ATR (R:R={TP_ATR_MULT/SL_ATR_MULT:.1f}:1)")
-    print(f"   Anti-peak  5m: 跳過若 BTC 5min > {MAX_5MIN_PUMP_PCT*100:.2f}%")
-    print(f"   Anti-chase 30m: 跳過若 BTC 30min > {MAX_30MIN_PUMP_PCT*100:.1f}%")
-    print(f"   Sym anti-peak 5m: 跳過若 sym 5min > {MAX_5MIN_PUMP_SYM*100:.2f}%")
+    print(f"   Anti-chase 30m (gate): 跳過若 BTC 30min (closed) > {MAX_30MIN_PUMP_PCT*100:.1f}%  [A2]")
+    print(f"   BTC/Sym 5m pump: 僅監控 [{MAX_5MIN_PUMP_PCT*100:.2f}% / {MAX_5MIN_PUMP_SYM*100:.2f}%] — gate已移除 [A1]")
+    print(f"   入場模式: Maker postOnly @ bid | fee {FEE_RATE_MAKER*100:.4f}% (vs taker {FEE_RATE*100:.4f}%)  [A4]")
     print(f"   入場 alpha: Lee-Ready net-flow z>{NET_FLOW_SIGMA}σ OR sniper(flow+accel+imbal>0.15)")
     print(f"   Timeout={TIMEOUT_SECONDS//60}min | BE@+0.7×ATR | Trail=0.6×ATR | ActiveSignals={ACTIVE_LONG_SIGNALS}")
-    print(f"   Fee: taker={FEE_RATE*100:.4f}% / maker={FEE_RATE_MAKER*100:.4f}%")
+    print(f"   TP viability guard: TP > 2×FEE_RATE×price ≈ {2*FEE_RATE*100:.4f}% gross  [A3]")
     print(f"   Regime緩存={REGIME_CACHE_TTL}s | ATR緩存={ATR_CACHE_TTL}s | Pos緩存={POSITIONS_CACHE_TTL}s")
     if not SIMULATION_MODE:
         print("=" * 60)
